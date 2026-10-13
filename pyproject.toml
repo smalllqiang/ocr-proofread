@@ -7,7 +7,9 @@ authors = [
     { name = "smalllqiang", email = "F11F10E8@outlook.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "pyside6-essentials>=6.12.0",
+]
 
 [project.scripts]
 ocr-proofread = "ocr_proofread:main"

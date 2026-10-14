@@ -54,20 +54,20 @@ uv run python -m ocr_proofread <路径...>    # 等价写法
 
 ## 快捷键
 
-| 按键 | 功能 |
-| --- | --- |
-| `Ctrl+Shift+O` | 打开文件夹 |
-| `Ctrl+O` | 导入图像文件 |
-| `←` / `A` / `PageUp` / `Backspace` | 上一张 |
-| `→` / `D` / `PageDown` / `Space` | 下一张 |
-| `Home` / `End` | 第一张 / 最后一张 |
-| 滚轮 或 `Ctrl+滚轮` | 以鼠标为中心缩放 |
-| `Ctrl+=` / `Ctrl+-` | 放大 / 缩小 |
-| `Ctrl+0` 或 `F` | 适应窗口 |
-| `Ctrl+1` | 实际大小（100%） |
-| `Ctrl+Q` | 退出 |
-| 中键拖动 | 平移画布 |
-| `Shift+滚轮` / `Alt+滚轮` | 水平 / 垂直滚动 |
+| 按键                               | 功能              |
+| ---------------------------------- | ----------------- |
+| `Ctrl+Shift+O`                     | 打开文件夹        |
+| `Ctrl+O`                           | 导入图像文件      |
+| `←` / `A` / `PageUp` / `Backspace` | 上一张            |
+| `→` / `D` / `PageDown` / `Space`   | 下一张            |
+| `Home` / `End`                     | 第一张 / 最后一张 |
+| 滚轮 或 `Ctrl+滚轮`                | 以鼠标为中心缩放  |
+| `Ctrl+=` / `Ctrl+-`                | 放大 / 缩小       |
+| `Ctrl+0` 或 `F`                    | 适应窗口          |
+| `Ctrl+1`                           | 实际大小（100%）  |
+| `Ctrl+Q`                           | 退出              |
+| 中键拖动                           | 平移画布          |
+| `Shift+滚轮` / `Alt+滚轮`          | 水平 / 垂直滚动   |
 
 程序内「帮助 → 快捷键」会弹出同一份列表。
 
@@ -79,16 +79,3 @@ uv run python tests/smoke_test.py     # 冒烟测试，无显示器时自动用 
 ```
 
 测试的组织方式与覆盖范围见 [docs/architecture.md](docs/architecture.md#测试)。
-
-### 提交约定
-
-提交信息统一用**中文**书写，格式遵循 Conventional Commits：
-
-```
-<type>(<scope>): <主题>
-
-正文说明「为什么改」，一行一条，每行约 72 字符。
-```
-
-常用的 type：`feat` / `fix` / `docs` / `refactor` / `test` / `chore`。主题用祈使句、不加句号；
-一个提交只做一件事。仓库早期历史是英文的，从本约定起一律用中文。

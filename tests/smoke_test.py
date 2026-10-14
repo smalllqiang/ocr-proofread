@@ -1,7 +1,7 @@
 """无界面冒烟测试：不需要 pytest，直接 ``uv run python tests/smoke_test.py``。
 
-覆盖：文件夹扫描与自然排序、打开/切换图像、缩放范围、快捷键绑定，
-以及坏图不让程序崩溃。
+覆盖：文件夹扫描与自然排序、打开/切换图像、缩放范围、快捷键绑定、ROI 框选与
+标注存取，以及坏图不让程序崩溃。
 
 在无显示器的环境下会自动使用 offscreen 平台插件。
 """
@@ -17,11 +17,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from PySide6.QtCore import QPoint, Qt  # noqa: E402
-from PySide6.QtGui import QColor, QImage  # noqa: E402
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt  # noqa: E402
+from PySide6.QtGui import QColor, QImage, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from ocr_proofread.annotations import (  # noqa: E402
+    Roi,
+    RoiStore,
+    sidecar_path,
+)
 from ocr_proofread.app import MainWindow  # noqa: E402
 from ocr_proofread.image_view import MAX_SCALE, MIN_SCALE  # noqa: E402
 from ocr_proofread.images import collect_images, load_qimage, natural_key  # noqa: E402
@@ -160,6 +165,227 @@ def test_zoom(window: MainWindow) -> None:
           "Ctrl+Shift+O" in _shortcut_texts(window.act_open_folder))
 
 
+def _send_mouse(widget, kind, pos: QPoint, button, buttons) -> None:
+    """往 widget 直接送一个鼠标事件。
+
+    QTest.mouseMove 不带按键状态，场景不会认为在拖动图元，所以这里自己造事件，
+    让 ``buttons()`` 在拖动过程中保持左键按下。
+    """
+    event = QMouseEvent(
+        kind,
+        QPointF(pos),
+        QPointF(widget.mapToGlobal(pos)),
+        button,
+        buttons,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(widget, event)
+    QApplication.processEvents()
+
+
+def drag(widget, start: QPoint, end: QPoint, *, steps: int = 4) -> None:
+    """按下左键从 start 拖到 end 再松开，中间分几步送 move 事件。"""
+    _send_mouse(widget, QEvent.Type.MouseButtonPress, start,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+    for step in range(1, steps + 1):
+        point = QPoint(
+            start.x() + (end.x() - start.x()) * step // steps,
+            start.y() + (end.y() - start.y()) * step // steps,
+        )
+        _send_mouse(widget, QEvent.Type.MouseMove, point,
+                    Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton)
+    _send_mouse(widget, QEvent.Type.MouseButtonRelease, end,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton)
+
+
+def same_rois(left, right, tolerance: float = 0.02) -> bool:
+    """两组标注是否一致（允许存盘时四舍五入带来的误差）。"""
+    if len(left) != len(right):
+        return False
+    return all(
+        abs(a.x - b.x) <= tolerance
+        and abs(a.y - b.y) <= tolerance
+        and abs(a.width - b.width) <= tolerance
+        and abs(a.height - b.height) <= tolerance
+        for a, b in zip(left, right)
+    )
+
+
+def inside(roi: Roi, bounds: QRectF, tolerance: float = 0.05) -> bool:
+    """标注是否落在给定范围内（边界上的浮点误差不算越界）。"""
+    return (
+        roi.x >= bounds.left() - tolerance
+        and roi.y >= bounds.top() - tolerance
+        and roi.x + roi.width <= bounds.right() + tolerance
+        and roi.y + roi.height <= bounds.bottom() + tolerance
+    )
+
+
+def test_roi_store(root: Path) -> None:
+    path = root / "img2.png"
+    check("没标过的图读出来是空的", RoiStore().get(path) == [])
+
+    store = RoiStore()
+    rois = [Roi(1, 2, 30, 40), Roi(50, 60, 70, 80)]
+    check("set 会写出边车文件", store.set(path, rois) is True)
+    check("边车文件落在图像旁边", sidecar_path(path).is_file(), str(sidecar_path(path)))
+    check("内容没变时不再写盘", store.set(path, rois) is False)
+    check("新的 store 能读回同样内容", same_rois(RoiStore().get(path), rois))
+    check("边车文件不会被当成图像", sidecar_path(path) not in collect_images(root))
+
+    sidecar_path(path).write_text("{ 这不是 JSON", encoding="utf-8")
+    check("损坏的标注文件按空处理", RoiStore().get(path) == [])
+
+    bad = sidecar_path(path)
+    bad.write_text('{"annotations": [{"x": 1, "y": 2}, {"x": 3, "y": 4, "w": 5, "h": 6}]}',
+                   encoding="utf-8")
+    check("坏记录跳过、好记录保留", RoiStore().get(path) == [Roi(3, 4, 5, 6)])
+
+    store = RoiStore()
+    store.set(path, [Roi(0, 0, 10, 10)])
+    store.set(path, [])
+    check("清空标注会删掉边车文件", not sidecar_path(path).exists())
+
+
+def test_roi_interaction(window: MainWindow, root: Path) -> None:
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+    window.view.fit_to_window()
+    QApplication.processEvents()
+
+    viewport = window.view.viewport()
+    view = window.view
+    check("初始场景里没有标注", view.roi_count() == 0)
+
+    # 左键拖出一个矩形
+    center = viewport.rect().center()
+    start = QPoint(center.x() - 60, center.y() - 40)
+    end = QPoint(center.x() + 60, center.y() + 40)
+    drag(viewport, start, end)
+    check("左键拖出矩形", view.roi_count() == 1, f"count={view.roi_count()}")
+    if view.roi_count() != 1:
+        return
+
+    expected = QRectF(view.mapToScene(start), view.mapToScene(end)).normalized()
+    roi = view.rois()[0]
+    check(
+        "矩形范围与拖动一致（±1.5 图像像素）",
+        abs(roi.x - expected.x()) < 1.5
+        and abs(roi.y - expected.y()) < 1.5
+        and abs(roi.width - expected.width()) < 1.5
+        and abs(roi.height - expected.height()) < 1.5,
+        f"{roi} vs {expected}",
+    )
+    check("新建的矩形自动选中", view.roi_items()[0].isSelected())
+    check("状态栏显示标注数", "标注 1" in window._label_roi.text(), window._label_roi.text())
+
+    # 单击（拖动距离过小）不应留下图元
+    drag(viewport, QPoint(center.x() - 150, center.y() - 100),
+         QPoint(center.x() - 149, center.y() - 100))
+    check("误点击不会留下碎图元", view.roi_count() == 1, f"count={view.roi_count()}")
+
+    # Esc 放弃正在拉的矩形（起点要避开已有图元，否则按下的是它的手柄）
+    esc_start = QPoint(center.x() - 170, center.y() - 130)
+    esc_end = QPoint(center.x() - 80, center.y() - 60)
+    _send_mouse(viewport, QEvent.Type.MouseButtonPress, esc_start,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+    _send_mouse(viewport, QEvent.Type.MouseMove, esc_end,
+                Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton)
+    QTest.keyClick(view, Qt.Key.Key_Escape)
+    _send_mouse(viewport, QEvent.Type.MouseButtonRelease, esc_end,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton)
+    check("Esc 放弃正在拉的矩形", view.roi_count() == 1, f"count={view.roi_count()}")
+    check("放弃后原图元没被改动", same_rois(view.rois(), [roi]), f"{view.rois()}")
+
+    view.roi_items()[0].setSelected(True)
+    QTest.keyClick(view, Qt.Key.Key_Escape)
+    check("Esc 取消选中", not any(item.isSelected() for item in view.roi_items()))
+
+    # 切图保存、切回恢复
+    window.show_next()
+    check("切到下一张时不带上一张的标注", view.roi_count() == 0)
+    check("切图后边车文件已写出", sidecar_path(paths[0]).is_file(), str(sidecar_path(paths[0])))
+    check("边车文件内容可读回", same_rois(RoiStore().get(paths[0]), [roi]),
+          f"{RoiStore().get(paths[0])}")
+    window.show_prev()
+    check("切回上一张恢复标注", same_rois(view.rois(), [roi]), f"{view.rois()}")
+
+    # 拖动图元本体
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    before = item.to_roi()
+    grip = view.mapFromScene(item.mapRectToScene(item.rect()).center())
+    drag(viewport, grip, QPoint(grip.x() + 30, grip.y() + 20))
+    after = view.roi_items()[0].to_roi()
+    check(
+        "拖动图元本体可移动",
+        after.x > before.x + 1 and after.y > before.y + 1,
+        f"{before} -> {after}",
+    )
+    check(
+        "移动不改变尺寸",
+        abs(after.width - before.width) < 1e-6 and abs(after.height - before.height) < 1e-6,
+    )
+
+    # 拖右下角手柄缩放
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    before = item.to_roi()
+    corner = view.mapFromScene(item.mapRectToScene(item.rect()).bottomRight())
+    drag(viewport, corner, QPoint(corner.x() + 25, corner.y() + 25))
+    after = view.roi_items()[0].to_roi()
+    check(
+        "拖手柄可放大",
+        after.width > before.width + 1 and after.height > before.height + 1,
+        f"{before} -> {after}",
+    )
+    check("缩放时左上角不动", abs(after.x - before.x) < 1e-6 and abs(after.y - before.y) < 1e-6)
+
+    # 拖左上角手柄，左上角跟着走
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    before = item.to_roi()
+    corner = view.mapFromScene(item.mapRectToScene(item.rect()).topLeft())
+    drag(viewport, corner, QPoint(corner.x() + 15, corner.y() + 10))
+    after = view.roi_items()[0].to_roi()
+    check(
+        "拖左上角手柄改变原点",
+        after.x > before.x + 1 and after.y > before.y + 1 and after.width < before.width - 1,
+        f"{before} -> {after}",
+    )
+
+    # 拖动不会跑出图像范围
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    image_rect = view.image_rect()
+    grip = view.mapFromScene(item.mapRectToScene(item.rect()).center())
+    drag(viewport, grip, QPoint(viewport.rect().right() - 2, viewport.rect().bottom() - 2))
+    moved = view.roi_items()[0].to_roi()
+    check(
+        "整体拖动被夹在图像内",
+        inside(moved, image_rect),
+        f"{moved} vs {image_rect}",
+    )
+
+    # Ctrl+S 手动保存
+    window.act_save_rois.trigger()
+    check("Ctrl+S 保存后有提示", "已保存" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+    check("保存内容与场景一致", same_rois(RoiStore().get(paths[0]), view.rois()))
+
+    # 删除选中
+    view.roi_items()[0].setSelected(True)
+    window.act_delete_roi.trigger()
+    check("Delete 删除选中标注", view.roi_count() == 0, f"count={view.roi_count()}")
+    window.show_next()
+    check("清空后边车文件被删除", not sidecar_path(paths[0]).exists())
+    window.show_prev()
+    check("重新切回仍是空的", view.roi_count() == 0)
+
+
 def _shortcut_texts(action) -> list[str]:
     return [seq.toString() for seq in action.shortcuts()]
 
@@ -216,11 +442,13 @@ def main() -> int:
         build_fixture(root)
 
         test_collect(root)
+        test_roi_store(root)
 
         window = MainWindow()
         test_navigation(window, root)
         test_zoom(window)
         test_broken_image(window, root)
+        test_roi_interaction(window, root)
         window.close()
 
     print()

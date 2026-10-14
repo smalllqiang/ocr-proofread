@@ -1,6 +1,10 @@
-"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、状态持久化。
+"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、ROI 标注、状态持久化。
 
-标注图元的挂载点与生命周期约定见 :mod:`ocr_proofread.image_view`。
+ROI 图元的挂载点与生命周期约定见 :mod:`ocr_proofread.image_view`；
+"每张图一份标注"的存取见 :mod:`ocr_proofread.annotations`。
+
+跨图状态的唯一持有者是这里：视图只持有当前这一张图，切图时本模块负责把
+上一张的标注落盘、把下一张的标注装回场景（见 :meth:`MainWindow._show`）。
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
+from .annotations import RoiStore
 from .image_view import ImageView
 from .images import IMAGE_NAME_FILTER, collect_images, is_image_file, load_qimage
 
@@ -35,15 +40,19 @@ class MainWindow(QMainWindow):
         self._index = -1
         self._image_size = QSize()
         self._settings = QSettings("ocr-proofread", "ocr-proofread")
+        self._roi_store = RoiStore()
 
         self.view = ImageView(self)
         self.view.zoomChanged.connect(self._on_zoom_changed)
+        self.view.roisChanged.connect(self._update_roi_label)
         self.setCentralWidget(self.view)
 
         self._label_file = QLabel("未打开图像 —— Ctrl+Shift+O 打开文件夹")
+        self._label_roi = QLabel("")
         self._label_zoom = QLabel("")
         status = self.statusBar()
         status.addWidget(self._label_file, 1)
+        status.addPermanentWidget(self._label_roi)
         status.addPermanentWidget(self._label_zoom)
 
         self._create_actions()
@@ -134,6 +143,24 @@ class MainWindow(QMainWindow):
             tip="一个图像像素对应一个屏幕像素",
         )
 
+        self.act_delete_roi = self._make_action(
+            "删除选中标注(&D)",
+            shortcuts=["Delete"],
+            slot=self._delete_selected_rois,
+            tip="删除当前选中的矩形标注",
+        )
+        self.act_clear_rois = self._make_action(
+            "清空当前图标注(&C)",
+            slot=self._clear_rois,
+            tip="删除当前图像上的全部矩形标注",
+        )
+        self.act_save_rois = self._make_action(
+            "保存标注(&S)",
+            shortcuts=["Ctrl+S"],
+            slot=self._save_rois,
+            tip="把当前图像的标注写入图像旁边的 .roi.json 文件",
+        )
+
     def _create_menus(self) -> None:
         bar = self.menuBar()
 
@@ -158,6 +185,12 @@ class MainWindow(QMainWindow):
         menu_browse.addSeparator()
         menu_browse.addAction(self.act_first)
         menu_browse.addAction(self.act_last)
+
+        menu_roi = bar.addMenu("标注(&R)")
+        menu_roi.addAction(self.act_delete_roi)
+        menu_roi.addAction(self.act_clear_rois)
+        menu_roi.addSeparator()
+        menu_roi.addAction(self.act_save_rois)
 
         menu_help = bar.addMenu("帮助(&H)")
         menu_help.addAction(
@@ -210,6 +243,7 @@ class MainWindow(QMainWindow):
         paths = [Path(p) for p in paths]
         if not paths:
             return
+        self._flush_rois()  # 先送走上一组里当前这张图的标注
         self._paths = paths
         self._index = -1
         self._remember_dir(paths[0].parent)
@@ -248,9 +282,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"无法打开 {path.name}：{error}", 6000)
             return
 
+        self._flush_rois()  # 离开上一张图之前先保存它的标注
         self._index = index
         self._image_size = image.size()
         self.view.set_image(image)
+        self.view.set_rois(self._roi_store.get(path))  # 装回这张图的标注
         self._update_status()
         self._update_actions()
 
@@ -271,12 +307,64 @@ class MainWindow(QMainWindow):
             self._show(len(self._paths) - 1)
 
     def _close_image(self) -> None:
+        self._flush_rois()
         self._paths = []
         self._index = -1
         self._image_size = QSize()
         self.view.set_image(None)
         self._update_status()
         self._update_actions()
+
+    # ------------------------------------------------------------------ 标注
+
+    def _current_path(self) -> Path | None:
+        if self._index < 0 or self._index >= len(self._paths):
+            return None
+        return self._paths[self._index]
+
+    def _flush_rois(self) -> None:
+        """把场景里的标注写回当前这张图；没有图像时什么都不做。
+
+        每次切图、重新打开文件夹、关闭窗口都会调用；:class:`RoiStore` 只在内容
+        真的变了才落盘，所以没标注过的图不会多出文件。
+        """
+        path = self._current_path()
+        if path is None or not self.view.has_image:
+            return
+        try:
+            self._roi_store.set(path, self.view.rois())
+        except OSError as exc:
+            self.statusBar().showMessage(f"保存 {path.name} 的标注失败：{exc}", 8000)
+
+    def _save_rois(self) -> None:
+        """Ctrl+S：立刻把当前图的标注写盘（平时切图会自动保存）。"""
+        path = self._current_path()
+        if path is None:
+            return
+        try:
+            self._roi_store.set(path, self.view.rois())
+        except OSError as exc:
+            self.statusBar().showMessage(f"保存 {path.name} 的标注失败：{exc}", 8000)
+            return
+        count = self.view.roi_count()
+        self.statusBar().showMessage(f"已保存 {path.name} 的 {count} 个标注", 4000)
+
+    def _delete_selected_rois(self) -> None:
+        count = self.view.delete_selected_rois()
+        if count:
+            self.statusBar().showMessage(f"已删除 {count} 个标注", 4000)
+        else:
+            self.statusBar().showMessage("没有选中的标注", 3000)
+
+    def _clear_rois(self) -> None:
+        count = self.view.roi_count()
+        if not count:
+            self.statusBar().showMessage("当前图没有标注", 3000)
+            return
+        self.view.clear_rois()
+        self.statusBar().showMessage(
+            f"已清空当前图的 {count} 个标注（切图或 Ctrl+S 时写入文件）", 5000
+        )
 
     def _update_actions(self) -> None:
         has_prev = self._index > 0
@@ -291,6 +379,9 @@ class MainWindow(QMainWindow):
         self.act_zoom_out.setEnabled(has_image)
         self.act_fit.setEnabled(has_image)
         self.act_actual.setEnabled(has_image)
+        self.act_delete_roi.setEnabled(has_image)
+        self.act_clear_rois.setEnabled(has_image)
+        self.act_save_rois.setEnabled(has_image)
 
     # ------------------------------------------------------------------ 状态
 
@@ -299,6 +390,7 @@ class MainWindow(QMainWindow):
             self._label_file.setText("未打开图像 —— Ctrl+Shift+O 打开文件夹")
             self._label_zoom.setText("")
             self.setWindowTitle(APP_NAME)
+            self._update_roi_label()
             return
         path = self._paths[self._index]
         self._label_file.setText(
@@ -306,6 +398,13 @@ class MainWindow(QMainWindow):
             f"    {self._image_size.width()}×{self._image_size.height()}    {path.parent}"
         )
         self.setWindowTitle(f"{path.name} — {APP_NAME}")
+        self._update_roi_label()
+
+    def _update_roi_label(self) -> None:
+        if self._index < 0:
+            self._label_roi.setText("")
+            return
+        self._label_roi.setText(f"标注 {self.view.roi_count()}")
 
     def _on_zoom_changed(self, scale: float) -> None:
         self._label_zoom.setText(f"缩放 {scale * 100:.0f}%")
@@ -329,6 +428,14 @@ class MainWindow(QMainWindow):
             "  Ctrl+= / Ctrl+-                     放大 / 缩小\n"
             "  Ctrl+0 或 F                         适应窗口\n"
             "  Ctrl+1                              实际大小 (100%)\n"
+            "\n"
+            "标注\n"
+            "  左键在图像上拖动                     拉出一个矩形标注\n"
+            "  左键拖动图元 / 拖动手柄              移动 / 缩放标注\n"
+            "  Delete                              删除选中的标注\n"
+            "  Ctrl+S                              保存当前图的标注\n"
+            "  Esc                                 放弃正在拉的矩形 / 取消选中\n"
+            "  标注自动保存在图像旁的 <文件名>.roi.json，切图时自动保存与恢复\n"
             "\n"
             "鼠标\n"
             "  中键拖动                             平移画布\n"
@@ -375,6 +482,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._flush_rois()  # 关窗前保存当前图的标注
         self._settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(event)
 

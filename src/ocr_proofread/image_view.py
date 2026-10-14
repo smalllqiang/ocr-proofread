@@ -1,8 +1,7 @@
 """QGraphicsView 子类：显示单张图像，负责缩放与平移。
 
-后续的 ROI 图元（矩形/多边形/文字框）都会加到 ``self.scene_`` 上，因此这里
-刻意不做任何"图元会被清掉"的假设：``set_image()`` 会清空场景，后续做标注时
-需要在切图时重新把该图的标注画回去。
+ROI 图元（矩形/多边形/文字框）应加到 :meth:`ImageView.scene` 上。
+``set_image()`` 会清空整个场景，因此调用方在切图后需要重新绘制该图的标注。
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ class ImageView(QGraphicsView):
 
     * 滚轮 / Ctrl+滚轮 —— 以鼠标位置为锚点缩放
     * Shift+滚轮 —— 水平滚动，Alt+滚轮 —— 垂直滚动
-    * 中键拖动 —— 平移画布（左键留给后续画 ROI）
+    * 中键拖动 —— 平移画布（左键不绑定行为，供框选使用）
     """
 
     #: 当前缩放比例，1.0 表示 100%
@@ -71,7 +70,7 @@ class ImageView(QGraphicsView):
     def set_image(self, image: QImage | None) -> None:
         """替换当前显示的图像；传入 ``None`` 表示清空。
 
-        注意：这里会清空整个场景，后续新增的 ROI 图元也会一并被移除。
+        注意：这里会清空整个场景，其中的 ROI 图元会一并被移除。
         """
         self._scene.clear()
         self._item = None

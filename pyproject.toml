@@ -1,7 +1,7 @@
 [project]
 name = "ocr-proofread"
 version = "0.1.0"
-description = "Add your description here"
+description = "OCR 校对 / 图像 ROI 标注工具（PySide6 + QGraphicsView）"
 readme = "README.md"
 authors = [
     { name = "smalllqiang", email = "F11F10E8@outlook.com" }

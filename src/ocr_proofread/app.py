@@ -1,7 +1,6 @@
-"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放。
+"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、状态持久化。
 
-这是"第一步"的实现，ROI 绘制留到下一步：``ImageView`` 场景已经就绪，
-后续只需在 set_image 之后把当前图的标注图元画回场景即可。
+标注图元的挂载点与生命周期约定见 :mod:`ocr_proofread.image_view`。
 """
 
 from __future__ import annotations

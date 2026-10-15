@@ -47,6 +47,16 @@ from ocr_proofread.ocr import (  # noqa: E402
     is_known_model,
     model_label,
 )
+from ocr_proofread.roi_item import HandleRole, RoiItem  # noqa: E402
+from ocr_proofread.text_box import (  # noqa: E402
+    EMPTY_HINT,
+    FONT_SIZE_STEP,
+    GAP,
+    MAX_CHARS,
+    MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
+    TextDirection,
+)
 
 FAILURES: list[str] = []
 
@@ -342,6 +352,18 @@ def test_roi_interaction(window: MainWindow, root: Path) -> None:
     )
     check("新建的矩形自动选中", view.roi_items()[0].isSelected())
     check("状态栏显示标注数", "标注 1" in window._label_roi.text(), window._label_roi.text())
+
+    # 刚画出来的框，手柄必须贴在矩形角上（setRect 会同步子图元，别堆在原点）
+    drawn = view.roi_items()[0]
+    bottom_right = next(h for h in drawn._handles if h.role is HandleRole.BOTTOM_RIGHT)
+    corner = drawn.rect().bottomRight()
+    check("新画出的框：手柄贴在矩形角上",
+          abs(bottom_right.pos().x() - corner.x()) < 1e-6
+          and abs(bottom_right.pos().y() - corner.y()) < 1e-6,
+          f"{bottom_right.pos()} vs {corner}")
+    check("新画出的框：文本框也贴在矩形边上",
+          abs(drawn.text_box().pos().x() - drawn.rect().right()) < 1e-6,
+          f"{drawn.text_box().pos()} vs {drawn.rect()}")
 
     # 单击（拖动距离过小）不应留下图元
     drag(viewport, QPoint(center.x() - 150, center.y() - 100),
@@ -657,6 +679,260 @@ def test_text_edit(window: MainWindow, root: Path) -> None:
     view.clear_rois()  # 别把标注留给后面的 OCR 测试
 
 
+def _box_point(view, box) -> QPoint:
+    """文本框在视口里的中心点。
+
+    框带 ``ItemIgnoresTransformations``，屏幕上从 ``box.pos()`` 起偏移
+    ``content_rect()`` 的像素，不需要经过画布缩放换算。
+    """
+    origin = view.mapFromScene(box.pos())
+    center = box.content_rect().center()
+    return QPoint(origin.x() + int(center.x()), origin.y() + int(center.y()))
+
+
+def test_text_box(window: MainWindow, root: Path) -> None:
+    """选中标注时旁边显示文本框：位置随排版方向、尺寸尽量与标注对齐、滚轮调字号。"""
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    view = window.view
+    viewport = view.viewport()
+    window._set_text_direction(TextDirection.HORIZONTAL)  # 从默认设定开始，别受上次运行影响
+    view.set_text_font_size(MIN_FONT_SIZE)
+    check("默认排版方向是横排", view.text_direction is TextDirection.HORIZONTAL)
+    check("默认字号就是最小字号", abs(view.text_font_size - MIN_FONT_SIZE) < 1e-9,
+          str(view.text_font_size))
+
+    view.set_rois([Roi(20, 20, 60, 30, "認識されたテキスト"), Roi(120, 50, 40, 25)])
+    view.fit_to_window()
+    QApplication.processEvents()
+
+    items = view.roi_items()
+    check("文本框不算标注", view.roi_count() == 2 and len(view.rois()) == 2,
+          f"count={view.roi_count()}")
+    check("没选中时不显示文本框", not any(item.text_box().isVisible() for item in items))
+
+    # ---- 选中 → 出现，框里是识别文本
+    item = items[0]
+    item.setSelected(True)
+    box = item.text_box()
+    check("选中后出现文本框", box.isVisible())
+    check("框里是识别文本", box.text() == "認識されたテキスト", box.text())
+    screen = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+
+    # ---- 横排：贴上下，宽度与标注的屏幕宽度一致
+    below = abs(box.pos().y() - item.rect().bottom()) < 1e-9
+    check("横排时框贴在标注的上方或下方",
+          abs(box.pos().x() - item.rect().left()) < 1e-9
+          and (below or abs(box.pos().y() - item.rect().top()) < 1e-9),
+          f"{box.pos()} vs {item.rect()}")
+    check("横排的框不压住标注",
+          box.content_rect().top() >= GAP - 1e-6 if below
+          else box.content_rect().bottom() <= -GAP + 1e-6,
+          str(box.content_rect()))
+    check("横排时框宽与标注的屏幕宽相等",
+          abs(box.content_rect().width() - screen.width()) < 1.5,
+          f"{box.content_rect().width()} vs {screen.width()}")
+
+    # ---- 尺寸跟着标注走：拖手柄把标注拉宽，框宽随之对齐
+    item.setSelected(True)
+    roi_rect = item.mapRectToScene(item.rect())
+    grip = view.mapFromScene(QPointF(roi_rect.right(), roi_rect.center().y()))
+    drag(viewport, grip, QPoint(grip.x() + 60, grip.y()))
+    screen = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+    check("拖宽标注后框宽跟着对齐",
+          abs(box.content_rect().width() - screen.width()) < 1.5,
+          f"{box.content_rect().width()} vs {screen.width()}")
+
+    # ---- 竖排：贴左右，高度与标注的屏幕高度一致
+    window._set_text_direction(TextDirection.VERTICAL)
+    QApplication.processEvents()
+    check("切换方向后现有的框跟着换", box.direction() is TextDirection.VERTICAL)
+    screen = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+    after = abs(box.pos().x() - item.rect().right()) < 1e-9
+    check("竖排时框贴在标注的左侧或右侧",
+          abs(box.pos().y() - item.rect().top()) < 1e-9
+          and (after or abs(box.pos().x() - item.rect().left()) < 1e-9),
+          f"{box.pos()} vs {item.rect()}")
+    check("竖排的框不压住标注",
+          box.content_rect().left() >= GAP - 1e-6 if after
+          else box.content_rect().right() <= -GAP + 1e-6,
+          str(box.content_rect()))
+    check("竖排时框高与标注的屏幕高相等",
+          abs(box.content_rect().height() - screen.height()) < 1.5,
+          f"{box.content_rect().height()} vs {screen.height()}")
+
+    # ---- 标注太小 / 排不下时，退回按文字自然大小排
+    view.set_rois([Roi(20, 20, 60, 4, "認識されたテキスト")])  # 竖排：高度放不下一个字
+    view.fit_to_window()
+    QApplication.processEvents()
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    box = item.text_box()
+    screen = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+    check("竖排：标注太矮时不再强行对齐高度",
+          box.content_rect().height() > screen.height() + 1,
+          f"{box.content_rect().height()} vs {screen.height()}")
+
+    window._set_text_direction(TextDirection.HORIZONTAL)
+    view.set_rois([Roi(20, 20, 4, 30, "認識されたテキスト")])  # 横排：宽度放不下一个字
+    view.fit_to_window()
+    QApplication.processEvents()
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    box = item.text_box()
+    screen = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+    check("横排：标注太窄时不再强行对齐宽度",
+          box.content_rect().width() > screen.width() + 1,
+          f"{box.content_rect().width()} vs {screen.width()}")
+
+    # ---- 没有视图信息时（脱离视图使用）按兜底规则贴边
+    standalone = RoiItem(QRectF(20, 20, 60, 30), bounds=view.image_rect(), text="認識")
+    standalone_box = standalone.text_box()
+    check("没有视图信息时横排默认贴下方",
+          standalone_box.after() and standalone_box.content_rect().top() >= GAP - 1e-6,
+          f"{standalone_box.after()} {standalone_box.content_rect()}")
+    standalone.set_text_direction(TextDirection.VERTICAL)
+    standalone.setRect(QRectF(150, 20, 40, 30))  # 图像右半边
+    check("没有视图信息时竖排按图像左右半边贴左侧",
+          not standalone_box.after() and standalone_box.content_rect().right() <= -GAP + 1e-6,
+          f"{standalone_box.after()} {standalone_box.content_rect()}")
+
+    # ---- 方向与字号都记进设置
+    check("方向记进设置", window._settings.value("text_direction") == "horizontal",
+          str(window._settings.value("text_direction")))
+    check("菜单勾选跟着换",
+          window._direction_actions[TextDirection.HORIZONTAL].isChecked()
+          and not window._direction_actions[TextDirection.VERTICAL].isChecked())
+    view.set_rois([Roi(20, 20, 60, 30, "あいうえお")])
+    check("新画的标注沿用当前方向",
+          view.roi_items()[0].text_box().direction() is TextDirection.HORIZONTAL)
+
+    # ---- 没识别过 / 超长文本
+    view.set_rois([Roi(20, 20, 60, 30)])
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    box = item.text_box()
+    check("没识别过也有框，显示提示",
+          box.isVisible() and box.text() == "" and box.display_text() == EMPTY_HINT,
+          box.display_text())
+    box.set_text("あ" * 1000)
+    check("超长文本截断并加省略号",
+          box.display_text().endswith("…") and len(box.display_text()) <= MAX_CHARS + 1,
+          str(len(box.display_text())))
+
+    # ---- 点 / 双击文本框
+    view.set_rois([Roi(20, 20, 60, 30, "认识")])
+    view.fit_to_window()
+    QApplication.processEvents()
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    box = item.text_box()
+    inside = _box_point(view, box)
+    check("文本框挡在标注旁边（命中测试用）", view.itemAt(inside) is box,
+          str(view.itemAt(inside)))
+
+    _send_mouse(viewport, QEvent.Type.MouseButtonPress, inside,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+    _send_mouse(viewport, QEvent.Type.MouseButtonRelease, inside,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton)
+    check("点文本框不会在下面拉出新标注", view.roi_count() == 1, f"count={view.roi_count()}")
+    check("点文本框选中它所属的标注", item.isSelected())
+
+    _double_click(viewport, inside)
+    check("双击文本框也能编辑这个标注的文本",
+          view.is_editing_text() and view._text_item is item)
+    QTest.keyClick(view._text_editor, Qt.Key.Key_Escape)
+
+
+def test_text_box_font(window: MainWindow, root: Path) -> None:
+    """光标在文本框上滚滚轮：调字号、框跟着变，放不下就拒绝，并且记进设置。"""
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    view = window.view
+    window._set_text_direction(TextDirection.HORIZONTAL)
+    view.set_text_font_size(MIN_FONT_SIZE)
+    view.set_rois([Roi(20, 20, 60, 30, "認識されたテキスト")])
+    view.fit_to_window()
+    QApplication.processEvents()
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    box = item.text_box()
+    point = _box_point(view, box)
+    screen = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+    check("字号检查：光标落在文本框上", view.itemAt(point) is box, str(view.itemAt(point)))
+
+    # ---- 调大一档：字号变大、框跟着变高、宽仍然和标注对齐；不缩放
+    scale_before = view.scale_factor
+    height_before = box.content_rect().height()
+    _send_wheel(window, 120, point)
+    check("框上滚滚轮改的是字号，不是缩放",
+          abs(view.scale_factor - scale_before) < 1e-9
+          and abs(view.text_font_size - (MIN_FONT_SIZE + FONT_SIZE_STEP)) < 1e-9,
+          f"scale={view.scale_factor:.3f} size={view.text_font_size}")
+    check("字号变大后框跟着变高", box.content_rect().height() > height_before,
+          f"{height_before} -> {box.content_rect().height()}")
+    check("调字号后依然与标注宽度对齐",
+          abs(box.content_rect().width() - screen.width()) < 1.5,
+          f"{box.content_rect().width()} vs {screen.width()}")
+    check("字号记进设置",
+          abs(window._settings.value("text_font_size", 0.0, type=float)
+              - view.text_font_size) < 1e-9,
+          str(window._settings.value("text_font_size")))
+    check("状态栏提示字号", "字号" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+
+    # ---- 一直调大到放不下为止：拒绝继续调大，并给出提示
+    limits: list[float] = []
+    view.textFontLimitReached.connect(limits.append)
+    for _ in range(80):
+        _send_wheel(window, 120, point)
+    reached = view.text_font_size
+    check("字号不会无上限地涨", reached < MAX_FONT_SIZE, str(reached))
+    check("到上限后给出提示",
+          bool(limits) and "最大字号" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+    check("上限处再大一档就放不下了", not item.can_enlarge_text(reached + FONT_SIZE_STEP),
+          str(reached))
+    _send_wheel(window, 120, point)
+    check("到上限后再滚一次字号也不变", abs(view.text_font_size - reached) < 1e-9,
+          f"{reached} -> {view.text_font_size}")
+
+    # ---- 调小回默认（最小）字号
+    for _ in range(100):
+        _send_wheel(window, -120, point)
+    check("字号能调回最小（默认）字号",
+          abs(view.text_font_size - MIN_FONT_SIZE) < 1e-9, str(view.text_font_size))
+    _send_wheel(window, -120, point)
+    check("已经是最小字号时不再变小",
+          abs(view.text_font_size - MIN_FONT_SIZE) < 1e-9, str(view.text_font_size))
+
+    # ---- 记在设置里的字号，下次启动读回来（并且会夹回允许范围）
+    window._settings.setValue("text_font_size", 18.0)
+    check("字号能从设置里读回", abs(window._restore_text_font_size() - 18.0) < 1e-9,
+          str(window._restore_text_font_size()))
+    window._settings.setValue("text_font_size", 999.0)
+    check("设置里的字号超上限会被夹住",
+          abs(window._restore_text_font_size() - MAX_FONT_SIZE) < 1e-9,
+          str(window._restore_text_font_size()))
+    window._settings.setValue("text_font_size", 1.0)
+    check("设置里的字号超下限会被夹住",
+          abs(window._restore_text_font_size() - MIN_FONT_SIZE) < 1e-9,
+          str(window._restore_text_font_size()))
+
+    # ---- 收尾：字号与方向都恢复默认，别把设置留给别的测试
+    view.set_text_font_size(MIN_FONT_SIZE)
+    window._settings.setValue("text_font_size", MIN_FONT_SIZE)
+    view.clear_rois()
+
+
 def _fake_manga_ocr_run(image: QImage) -> tuple[str, dict]:
     """用假的 ``manga_ocr`` 模块走一遍 :class:`MangaOcrEngine`，验证接线。
 
@@ -860,13 +1136,15 @@ def fits_in_viewport(window: MainWindow, tolerance: int = 3) -> bool:
     return viewport.contains(shown)
 
 
-def _send_wheel(window: MainWindow, delta: int) -> None:
+def _send_wheel(window: MainWindow, delta: int, pos: QPoint | None = None) -> None:
     from PySide6.QtCore import QPointF
     from PySide6.QtGui import QWheelEvent
 
+    if pos is None:
+        pos = QPoint(60, 40)
     event = QWheelEvent(
-        QPointF(60, 40),
-        QPointF(60, 40),
+        QPointF(pos),
+        QPointF(window.view.viewport().mapToGlobal(pos)),
         QPoint(0, 0),
         QPoint(0, delta),
         Qt.MouseButton.NoButton,
@@ -912,6 +1190,8 @@ def main() -> int:
         test_roi_interaction(window, root)
         test_hand_mode(window, root)
         test_text_edit(window, root)
+        test_text_box(window, root)
+        test_text_box_font(window, root)
         test_ocr_workflow(window, root, engine)
         test_ocr_cancel(window, root, engine)
         test_ocr_merge(window, root)

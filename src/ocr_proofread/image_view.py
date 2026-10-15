@@ -27,6 +27,15 @@ from PySide6.QtWidgets import (
 
 from .annotations import Roi
 from .roi_item import MIN_SIZE, RoiHandle, RoiItem
+from .text_box import (
+    DEFAULT_FONT_SIZE,
+    DEFAULT_TEXT_DIRECTION,
+    FONT_SIZE_STEP,
+    MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
+    RoiTextBox,
+    TextDirection,
+)
 
 #: 缩放上下限，避免滚轮把图缩到看不见或者撑爆
 MIN_SCALE = 0.02
@@ -100,7 +109,7 @@ class ImageView(QGraphicsView):
     * 空格按住 + 左键拖动 —— 平移画布（抓手模式），此时不拉新矩形、也不拖动图元
     * 左键在图像空白处拖动 —— 拉出一个新矩形；落在已有图元上时交给场景，
       即选中 / 拖动 / 拖手柄缩放
-    * 双击已有图元 —— 就地编辑这个 ROI 的文本（见 :meth:`begin_text_edit`）
+    * 双击已有图元或它的文本框 —— 就地编辑这个 ROI 的文本（见 :meth:`begin_text_edit`）
     * Esc —— 放弃正在拉的矩形，或取消选中
     """
 
@@ -113,6 +122,12 @@ class ImageView(QGraphicsView):
     #: 就地编辑文本被采纳时发出（放弃编辑、没有改动时不发）
     roiTextChanged = Signal()
 
+    #: 文本框字号变了（在框上滚滚轮），带上新字号；上层负责记进设置
+    textFontChanged = Signal(float)
+
+    #: 想调大字号但已经放不下整段文字了，带上当前字号
+    textFontLimitReached = Signal(float)
+
     #: 场景里的选中状态变化（选中 / 取消选中 / 改选另一个）时发出
     selectionChanged = Signal()
 
@@ -121,6 +136,7 @@ class ImageView(QGraphicsView):
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
         self._scene.selectionChanged.connect(self.selectionChanged)
+        self._scene.selectionChanged.connect(self._sync_text_boxes)
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -143,8 +159,10 @@ class ImageView(QGraphicsView):
         self._draw_origin = QPointF()
         self._text_editor: _RoiTextEditor | None = None  # 双击图元后盖上去的编辑器
         self._text_item: RoiItem | None = None  # 编辑器正在改的那个图元
-        # 缩放后编辑器要跟着 ROI 挪，否则输入框会留在原地
-        self.zoomChanged.connect(lambda _scale: self._place_text_editor())
+        self._text_direction = DEFAULT_TEXT_DIRECTION  # 标注旁文本框的排版方向
+        self._text_font_size = DEFAULT_FONT_SIZE  # 文本框字号（pt），最小即默认
+        # 缩放后：屏幕坐标的就地编辑器与贴在视口边上的文本框都要重新摆一次
+        self.zoomChanged.connect(self._on_zoom_changed)
 
     # ------------------------------------------------------------------ 图像
 
@@ -257,9 +275,80 @@ class ImageView(QGraphicsView):
 
     def _add_roi_item(self, rect: QRectF, text: str = "") -> RoiItem:
         bounds = self.image_rect()
-        item = RoiItem(rect, bounds=bounds if not bounds.isEmpty() else None, text=text)
+        item = RoiItem(
+            rect,
+            bounds=bounds if not bounds.isEmpty() else None,
+            text=text,
+            text_direction=self._text_direction,
+            text_font_size=self._text_font_size,
+        )
         self._scene.addItem(item)
         return item
+
+    # ---------------------------------------------------------------- 文本框
+
+    @property
+    def text_direction(self) -> TextDirection:
+        """标注旁文本框的排版方向（全局设定）。"""
+        return self._text_direction
+
+    def set_text_direction(self, direction: TextDirection) -> None:
+        """换标注旁文本框的排版方向，并应用到当前图上的全部图元。
+
+        方向决定框贴哪个轴（横排贴上下、竖排贴左右）；新画的框跟着这个方向走
+        （见 :meth:`_add_roi_item`）。方向只是显示设定，不写进标注文件。
+        """
+        self._text_direction = direction
+        for item in self.roi_items():
+            item.set_text_direction(direction)
+        self._sync_text_boxes()
+
+    @property
+    def text_font_size(self) -> float:
+        """标注旁文本框的字号（pt，全局设定）。"""
+        return self._text_font_size
+
+    def set_text_font_size(self, size: float) -> None:
+        """换文本框字号；默认值就是最小字号，再小也压不下去。"""
+        self._text_font_size = max(min(float(size), MAX_FONT_SIZE), MIN_FONT_SIZE)
+        self._sync_text_boxes()
+
+    def _sync_text_boxes(self) -> None:
+        """按视口给选中的标注重算文本框：尺寸要不要跟标注对齐、贴哪一侧。
+
+        视图是唯一知道画布缩放与视口大小的地方，所以由它把"标注在屏幕上的位置 +
+        视口 + 字号"喂给图元（``RoiItem.update_text_box()``）；图元与文本框都不去
+        反问视图。选中、缩放、改变窗口大小、滚动、拖完标注之后都要重算一次。
+        """
+        viewport = QRectF(self.viewport().rect())
+        for item in self._scene.selectedItems():
+            if not isinstance(item, RoiItem):
+                continue  # 没选中的框本来就看不见，选中的也只会是标注
+            screen = QRectF(
+                self.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+            )
+            item.update_text_box(
+                roi_screen=screen, viewport=viewport, font_size=self._text_font_size
+            )
+
+    def _on_zoom_changed(self, _scale: float) -> None:
+        self._place_text_editor()
+        self._sync_text_boxes()
+
+    def _adjust_text_font(self, item: RoiItem, delta: float) -> None:
+        """在文本框上滚滚轮：调字号；再大一档就放不下时拒绝并让上层提示。"""
+        target = self._text_font_size + (FONT_SIZE_STEP if delta > 0 else -FONT_SIZE_STEP)
+        target = max(min(target, MAX_FONT_SIZE), MIN_FONT_SIZE)
+        if abs(target - self._text_font_size) < 1e-9:
+            if delta > 0:
+                self.textFontLimitReached.emit(self._text_font_size)
+            return
+        if target > self._text_font_size and not item.can_enlarge_text(target):
+            self.textFontLimitReached.emit(self._text_font_size)
+            return
+        self._text_font_size = target
+        self._sync_text_boxes()
+        self.textFontChanged.emit(target)
 
     # ---------------------------------------------------------------- 文本编辑
 
@@ -428,8 +517,13 @@ class ImageView(QGraphicsView):
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         super().resizeEvent(event)
         self._place_text_editor()  # 编辑器是屏幕坐标的，窗口变了要重新贴回 ROI
+        self._sync_text_boxes()
         if self._auto_fit:
             self.fit_to_window()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802
+        super().scrollContentsBy(dx, dy)
+        self._sync_text_boxes()  # 平移画布后，标注在视口里的位置变了
 
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802
         if self._item is None:
@@ -444,6 +538,14 @@ class ImageView(QGraphicsView):
             return
 
         modifiers = event.modifiers()
+        if modifiers == Qt.KeyboardModifier.NoModifier:
+            # 光标在文本框上：滚轮改字号，不缩放
+            box_owner = self._text_box_owner(event.position())
+            if box_owner is not None:
+                self._adjust_text_font(box_owner, delta)
+                event.accept()
+                return
+
         if modifiers & Qt.KeyboardModifier.ShiftModifier:
             bar = self.horizontalScrollBar()
             bar.setValue(bar.value() - delta)
@@ -465,21 +567,57 @@ class ImageView(QGraphicsView):
             self._begin_pan(event.button(), event.position())
             event.accept()
             return
-        if event.button() == Qt.MouseButton.LeftButton and self._begin_roi(event.position()):
-            event.accept()
-            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            box_owner = self._text_box_owner(event.position())
+            if box_owner is not None:  # 点文本框 = 选中它所属的框，不在下面拉新矩形
+                self.select_roi_item(box_owner, center=False)
+                event.accept()
+                return
+            if self._begin_roi(event.position()):
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        """双击已有图元 → 就地编辑它的文本；其余情况照常交给场景。"""
+        """双击已有图元或它的文本框 → 就地编辑它的文本；其余情况交给场景。"""
         if event.button() == Qt.MouseButton.LeftButton and not self._hand_mode:
-            target = self.itemAt(event.position().toPoint())
-            if isinstance(target, RoiHandle):  # 手柄也算所在的那个框
-                target = target.parentItem()
-            if isinstance(target, RoiItem) and self.begin_text_edit(target):
+            item = self._roi_at(event.position())
+            if item is not None and self.begin_text_edit(item):
                 event.accept()
                 return
         super().mouseDoubleClickEvent(event)
+
+    def _roi_at(self, viewport_pos: QPointF) -> RoiItem | None:
+        """视口坐标下命中的 ROI：手柄与文本框都算它们所在的那个框。"""
+        target = self.itemAt(viewport_pos.toPoint())
+        if isinstance(target, RoiTextBox):
+            under = self._roi_item_at(viewport_pos)
+            if under is not None:
+                return under  # 框只是显示层：它盖住了别的标注时，那个标注优先
+            target = target.parentItem()
+        elif isinstance(target, RoiHandle):
+            target = target.parentItem()
+        return target if isinstance(target, RoiItem) else None
+
+    def _roi_item_at(self, viewport_pos: QPointF) -> RoiItem | None:
+        """视口坐标下被"真正压住"的 ROI 图元（不算手柄与文本框）。"""
+        for item in self.items(viewport_pos.toPoint()):
+            if isinstance(item, RoiItem):
+                return item
+        return None
+
+    def _text_box_owner(self, viewport_pos: QPointF) -> RoiItem | None:
+        """视口坐标下命中文本框时，返回它所属的 ROI。
+
+        框盖住了别的标注时返回 ``None``：那是显示层，别抢下面标注的鼠标操作。
+        """
+        target = self.itemAt(viewport_pos.toPoint())
+        if not isinstance(target, RoiTextBox):
+            return None
+        if self._roi_item_at(viewport_pos) is not None:
+            return None
+        parent = target.parentItem()
+        return parent if isinstance(parent, RoiItem) else None
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._drawing is not None:
@@ -496,6 +634,9 @@ class ImageView(QGraphicsView):
             event.accept()
             return
         super().mouseMoveEvent(event)
+        if self._scene.mouseGrabberItem() is not None:
+            # 正在拖标注本体或手柄：文本框的对齐尺寸与贴边要跟着一起变
+            self._sync_text_boxes()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self._drawing is not None:
@@ -507,6 +648,8 @@ class ImageView(QGraphicsView):
             event.accept()
             return
         super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._sync_text_boxes()  # 拖完标注本体 / 手柄后，框可能要换边
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
@@ -528,12 +671,12 @@ class ImageView(QGraphicsView):
     def _begin_roi(self, viewport_pos: QPointF) -> bool:
         """判断这次左键按下要不要开始拉新矩形。
 
-        落在已有图元（含手柄）上时返回 ``False``，交给场景做选中/移动/缩放；
-        落在图像之外或还没有图像时不响应。
+        落在已有图元（含手柄、标注旁的文本框）上时返回 ``False``，交给场景做
+        选中/移动/缩放；落在图像之外或还没有图像时不响应。
         """
         if self._item is None:
             return False
-        if isinstance(self.itemAt(viewport_pos.toPoint()), (RoiItem, RoiHandle)):
+        if isinstance(self.itemAt(viewport_pos.toPoint()), (RoiItem, RoiHandle, RoiTextBox)):
             return False
         scene_pos = self.mapToScene(viewport_pos.toPoint())
         if not self.image_rect().contains(scene_pos):

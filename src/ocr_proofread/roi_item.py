@@ -4,6 +4,10 @@
 手柄可以改尺寸。手柄用 ``ItemIgnoresTransformations`` 绘制，因此不论画布缩放到
 多少，看上去都是同样大的小方块。
 
+图元旁边还挂着一个文本小框（:class:`~ocr_proofread.text_box.RoiTextBox`），只在
+自己被选中时出现，显示这个框的识别文本；它是本图元的子图元，所以跟着标注一起
+移动、缩放、删除，不需要额外的簿记。
+
 坐标约定见 :mod:`ocr_proofread.image_view`：场景单位 = 图像像素，原点在图像左上角。
 图元只用平移（不改 ``pos`` 之外的变换），所以 :meth:`RoiItem.to_roi` 可以直接
 ``mapRectToScene`` 得到图像坐标。
@@ -18,6 +22,12 @@ from PySide6.QtGui import QBrush, QColor, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsRectItem
 
 from .annotations import Roi
+from .text_box import (
+    DEFAULT_FONT_SIZE,
+    DEFAULT_TEXT_DIRECTION,
+    RoiTextBox,
+    TextDirection,
+)
 
 #: 手柄的屏幕边长（像素），不随缩放变化
 HANDLE_SIZE = 9.0
@@ -144,6 +154,8 @@ class RoiItem(QGraphicsRectItem):
         *,
         bounds: QRectF | None = None,
         text: str = "",
+        text_direction: TextDirection = DEFAULT_TEXT_DIRECTION,
+        text_font_size: float = DEFAULT_FONT_SIZE,
         parent: QGraphicsItem | None = None,
     ) -> None:
         super().__init__(QRectF(rect).normalized(), parent)
@@ -160,9 +172,16 @@ class RoiItem(QGraphicsRectItem):
         self._apply_tooltip()
         self._apply_pen()
 
+        self._text_box = RoiTextBox(
+            direction=text_direction, font_size=text_font_size, parent=self
+        )
+        self._text_box.set_text(text)
+        self._text_box.setVisible(False)  # 只有被选中的标注才露出来
+        self._text_box_after: bool | None = None  # 视图给的贴边方向；None = 按兜底规则
         self._handles = [RoiHandle(self, role) for role in HandleRole]
         self.set_handles_visible(False)
         self._sync_handles()
+        self._sync_text_box_anchor()
 
     # ------------------------------------------------------------------ 数据
 
@@ -175,11 +194,77 @@ class RoiItem(QGraphicsRectItem):
         return self._text
 
     def set_text(self, text: str) -> None:
-        """写入 OCR 结果（同时刷新提示气泡）。"""
+        """写入 OCR 结果（同时刷新提示气泡与旁边的文本框）。"""
         self._text = text
+        self._text_box.set_text(text)
         self._apply_tooltip()
 
+    def text_box(self) -> RoiTextBox:
+        """旁边那个显示识别文本的小框（只在选中时可见）。"""
+        return self._text_box
+
+    def set_text_direction(self, direction: TextDirection) -> None:
+        """换文本框的排版方向（横排 / 竖排）；全局设定，由上层统一设置。
+
+        方向同时决定框贴在哪个轴（横排贴上下、竖排贴左右），所以换方向后要重新
+        贴边；视图在场时紧接着会用 :meth:`update_text_box` 给出准确的一侧。
+        """
+        self._text_box.set_direction(direction)
+        self._text_box_after = None  # "上下"与"左右"的含义变了，交回自动判断
+        self._sync_text_box_anchor()
+
+    def text_box_after(self) -> bool | None:
+        """文本框贴在标注的"后面"一侧吗；``None`` 表示还没被视图定过。"""
+        return self._text_box_after
+
+    def update_text_box(
+        self, *, roi_screen: QRectF, viewport: QRectF, font_size: float
+    ) -> None:
+        """视图把"标注在屏幕上的位置 + 视口 + 字号"喂进来，重算框的形状与贴边。
+
+        视图是唯一知道画布缩放与视口大小的地方；图元自己不去问视图。横排贴上下、
+        竖排贴左右，贴哪一侧看余量：能整框放下的一侧优先，其次余量大的一侧。
+        """
+        box = self._text_box
+        box.set_font_size(font_size)
+        vertical = box.direction().vertical
+        if vertical:
+            cross = roi_screen.height()
+            room_before = roi_screen.left() - viewport.left()
+            room_after = viewport.right() - roi_screen.right()
+        else:
+            cross = roi_screen.width()
+            room_before = roi_screen.top() - viewport.top()
+            room_after = viewport.bottom() - roi_screen.bottom()
+        box.apply_placement(
+            cross=cross, room=max(room_before, room_after), viewport=viewport.size()
+        )
+
+        extent = box.content_rect().width() if vertical else box.content_rect().height()
+        if room_after >= extent:
+            after = True
+        elif room_before >= extent:
+            after = False
+        else:
+            after = room_after >= room_before
+        self._text_box_after = after
+        self._sync_text_box_anchor()
+
+    def can_enlarge_text(self, font_size: float) -> bool:
+        """这个字号下文本框还放得下整段文字吗？滚轮调大字号时的判据。"""
+        return self._text_box.fits_font_size(font_size)
+
     # ------------------------------------------------------------------ 交互
+
+    def setRect(self, rect: QRectF) -> None:  # noqa: N802 (Qt 命名)
+        """改几何时把手柄与文本框一起挪过去。
+
+        ``QGraphicsRectItem.setRect()`` 不会通知子图元，直接调它会让手柄和文本框
+        留在旧位置（画新框时最明显），所以这里统一补一次同步。
+        """
+        super().setRect(QRectF(rect).normalized())
+        self._sync_handles()
+        self._sync_text_box_anchor()
 
     def resize_by(self, role: HandleRole, delta: QPointF, start_rect: QRectF) -> None:
         """按手柄拖动量算出新矩形。
@@ -207,8 +292,7 @@ class RoiItem(QGraphicsRectItem):
 
         if right - left < MIN_SIZE or bottom - top < MIN_SIZE:
             return
-        self.setRect(QRectF(left, top, right - left, bottom - top))
-        self._sync_handles()
+        self.setRect(QRectF(left, top, right - left, bottom - top))  # 顺带同步子图元
 
     def set_handles_visible(self, visible: bool) -> None:
         """手柄只在该图元被选中时出现，避免未选中时误抓手柄。"""
@@ -218,9 +302,12 @@ class RoiItem(QGraphicsRectItem):
     def itemChange(self, change, value):  # noqa: N802
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             self.set_handles_visible(bool(value))
+            self._text_box.setVisible(bool(value))
             self._apply_pen()
         elif change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
             return self._clamp_position(value)
+        elif change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self._sync_text_box_anchor()  # 挪过图像中线时兜底的贴边要重算
         return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event) -> None:  # noqa: N802
@@ -240,6 +327,34 @@ class RoiItem(QGraphicsRectItem):
         for handle in self._handles:
             fx, fy = handle.role.factors
             handle.setPos(rect.left() + fx * rect.width(), rect.top() + fy * rect.height())
+
+    def _sync_text_box_anchor(self) -> None:
+        """把文本框贴到标注旁边。
+
+        贴哪一侧：视图给过就听视图的（:meth:`update_text_box`），没给过就按兜底规则
+        ——横排默认下方，竖排看标注落在图像的左半边还是右半边。原点放在标注的角上，
+        内容往哪边铺由 :meth:`RoiTextBox.set_after` 决定，所以这里不需要知道画布缩放，
+        也不会因为缩放而错位。
+        """
+        rect = self.rect()
+        after = self._text_box_after
+        if after is None:
+            after = self._default_text_box_after(rect)
+        self._text_box.set_after(after)
+        if self._text_box.direction().vertical:
+            self._text_box.setPos(rect.right() if after else rect.left(), rect.top())
+        else:
+            self._text_box.setPos(rect.left(), rect.bottom() if after else rect.top())
+
+    def _default_text_box_after(self, rect: QRectF) -> bool:
+        """没有视图信息时的兜底贴边：横排贴下方；竖排按标注在图像里的位置定左右。"""
+        if not self._text_box.direction().vertical:
+            return True
+        if self._bounds is not None and not self._bounds.isEmpty():
+            # 图元只平移，pos.x + 局部 x 就是场景（图像）x，不依赖它有没有进场景
+            center_x = self.pos().x() + rect.center().x()
+            return center_x <= self._bounds.center().x()
+        return True
 
     def _apply_tooltip(self) -> None:
         hint = "拖动移动，拖动方块手柄缩放，双击编辑文本，Delete 删除"

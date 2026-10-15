@@ -45,6 +45,13 @@ from .ocr import (
     is_known_model,
     model_label,
 )
+from .text_box import (
+    DEFAULT_FONT_SIZE,
+    DEFAULT_TEXT_DIRECTION,
+    MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
+    TextDirection,
+)
 
 if TYPE_CHECKING:  # 只用于类型标注，避免运行时多一层依赖
     from .annotations import Roi
@@ -134,6 +141,8 @@ class MainWindow(QMainWindow):
         self._image_size = QSize()
         self._settings = QSettings("ocr-proofread", "ocr-proofread")
         self._roi_store = RoiStore()
+        self._text_direction = self._restore_text_direction()
+        self._text_font_size = self._restore_text_font_size()
 
         # OCR：引擎按模型名字缓存，模型很重，不能每识别一次就加载一遍
         self._ocr_factory = ocr_factory or create_engine
@@ -143,8 +152,12 @@ class MainWindow(QMainWindow):
         self._panel_items: list[RoiItem] = []
 
         self.view = ImageView(self)
+        self.view.set_text_direction(self._text_direction)
+        self.view.set_text_font_size(self._text_font_size)
         self.view.zoomChanged.connect(self._on_zoom_changed)
         self.view.roisChanged.connect(self._update_roi_label)
+        self.view.textFontChanged.connect(self._on_text_font_changed)
+        self.view.textFontLimitReached.connect(self._on_text_font_limit)
         self.setCentralWidget(self.view)
         # 空格是"按住"的修饰键，得知道按下与松开两个时刻；焦点可能不在视图上
         # （刚点过右侧结果面板），所以装在应用级过滤，见 :meth:`MainWindow.eventFilter`
@@ -338,6 +351,19 @@ class MainWindow(QMainWindow):
         menu_view.addSeparator()
         menu_view.addAction(self.act_fit)
         menu_view.addAction(self.act_actual)
+        menu_view.addSeparator()
+        menu_direction = menu_view.addMenu("文本框排版方向(&T)")
+        self._direction_actions: dict[TextDirection, QAction] = {}
+        for direction in TextDirection:
+            action = QAction(direction.label, self)
+            action.setCheckable(True)
+            action.setChecked(direction is self._text_direction)
+            action.setStatusTip(f"选中的标注旁，文本框按{direction.label}显示")
+            action.triggered.connect(
+                lambda _checked=False, value=direction: self._set_text_direction(value)
+            )
+            menu_direction.addAction(action)
+            self._direction_actions[direction] = action
 
         menu_browse = bar.addMenu("浏览(&B)")
         menu_browse.addAction(self.act_prev)
@@ -577,6 +603,42 @@ class MainWindow(QMainWindow):
         self.act_ocr_all.setEnabled(bool(items) and not busy)
         self.act_ocr_selected.setEnabled(
             any(item.isSelected() for item in items) and not busy
+        )
+
+    # -------------------------------------------------------------- 文本框排版
+
+    def _restore_text_direction(self) -> TextDirection:
+        """从设置里取文本框的排版方向；名字已经不认识时退回默认的横排。"""
+        stored = self._settings.value(
+            "text_direction", DEFAULT_TEXT_DIRECTION.value, type=str
+        )
+        return TextDirection.from_name(stored)
+
+    def _set_text_direction(self, direction: TextDirection) -> None:
+        """切换标注旁文本框的排版方向（记进 QSettings，下次启动继续用）。"""
+        self._text_direction = direction
+        self._settings.setValue("text_direction", direction.value)
+        self.view.set_text_direction(direction)
+        self._sync_text_direction_actions()
+        self.statusBar().showMessage(f"文本框排版方向：{direction.label}", 4000)
+
+    def _sync_text_direction_actions(self) -> None:
+        for value, action in self._direction_actions.items():
+            action.setChecked(value is self._text_direction)
+
+    def _restore_text_font_size(self) -> float:
+        """从设置里取文本框字号；超出允许范围就夹回范围。"""
+        stored = self._settings.value("text_font_size", DEFAULT_FONT_SIZE, type=float)
+        return max(min(stored, MAX_FONT_SIZE), MIN_FONT_SIZE)
+
+    def _on_text_font_changed(self, size: float) -> None:
+        """在文本框上滚轮改了字号：记进设置并提示一下。"""
+        self._settings.setValue("text_font_size", size)
+        self.statusBar().showMessage(f"文本框字号：{size:g} pt", 3000)
+
+    def _on_text_font_limit(self, size: float) -> None:
+        self.statusBar().showMessage(
+            f"已经是这个框放得下的最大字号（{size:g} pt），再大就排不下了", 4000
         )
 
     # -------------------------------------------------------------------- OCR
@@ -909,6 +971,9 @@ class MainWindow(QMainWindow):
             "  Delete                              删除选中的标注\n"
             "  Ctrl+S                              保存当前图的标注\n"
             "  Esc                                 放弃正在拉的矩形 / 取消选中\n"
+            "  选中标注时，旁边的小框显示这个框的识别文本\n"
+            "    横排贴上下、竖排贴左右；光标放在框上滚滚轮可以调字号\n"
+            "  「视图 → 文本框排版方向」切换横排 / 竖排（记进设置）\n"
             "  标注自动保存在图像旁的 <文件名>.roi.json，切图时自动保存与恢复\n"
             "\n"
             "OCR\n"

@@ -7,8 +7,8 @@
 
 当前版本做"浏览 + 框选 + 每图标注存取 + OCR 识别 + 文本编辑"：打开图像、缩放平移、上下张
 切换、左键拖出矩形并调整、切图时自动保存与恢复标注，对选中的或全部的 ROI 跑识别、
-把文本挂在对应的 ROI 上一起落盘，并且可以双击就地改掉这段文本。批量替换、逐字校对与
-导出等更完整的校对工作流不在范围内。
+把文本挂在对应的 ROI 上一起落盘，选中标注时在它旁边显示这段文本（横排 / 竖排可切），
+并且可以双击就地改掉它。批量替换、逐字校对与导出等更完整的校对工作流不在范围内。
 
 由此定下两条贯穿全项目的原则：
 
@@ -118,6 +118,7 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 │   ├── app.py                  # 主窗口：菜单、快捷键、打开/切换图像、标注存取、OCR 调度
 │   ├── image_view.py           # QGraphicsView 子类：显示、缩放、平移（中键 / 空格抓手）、左键框选
 │   ├── roi_item.py             # 场景里的矩形图元：选中、移动、八向手柄缩放、带识别文本
+│   ├── text_box.py             # 标注旁的文本小框：排版方向（横排 / 竖排）、尺寸与贴边
 │   ├── annotations.py          # Roi 数据结构 + RoiStore（内存缓存＋JSON 边车文件）
 │   ├── images.py               # 图像扫描、自然排序、读取（无界面依赖）
 │   └── ocr.py                  # OCR 引擎注册表、ROI 裁剪、后台识别任务（无控件依赖）
@@ -125,17 +126,24 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 ```
 
 - **`app.py` / `MainWindow`**：唯一持有"图像列表 + 当前索引 + 标注存储 + OCR 任务"的地方。
-  菜单、快捷键、拖放、命令行参数最终都汇入 `open_paths()`。窗口大小、上次目录与上次用的
-  识别模型通过 `QSettings` 持久化；结果面板里双击改文本也在这里收口（`_on_panel_item_changed`）。
+  菜单、快捷键、拖放、命令行参数最终都汇入 `open_paths()`。窗口大小、上次目录、上次用的
+  识别模型、文本框排版方向与字号通过 `QSettings` 持久化；结果面板里双击改文本也在这里
+  收口（`_on_panel_item_changed`）。
 - **`image_view.py` / `ImageView`**：只负责当前这张图的变换（缩放、平移）、场景管理，
-  "左键在图像空白处拉矩形"的交互，以及双击图元后的文本就地编辑（编辑器是视口的子控件，
-  见 [扩展点与约定](#扩展点与约定)）；对外暴露 `set_image()`、`image()`、`set_rois()` /
-  `rois()`、`select_roi_item()`、`set_hand_mode()`、`begin_text_edit()` /
-  `commit_text_edit()` / `cancel_text_edit()`，以及 `zoomChanged`、`roisChanged`、
-  `roiTextChanged`、`selectionChanged` 信号。
+  "左键在图像空白处拉矩形"的交互，双击图元后的文本就地编辑（编辑器是视口的子控件，
+  见 [扩展点与约定](#扩展点与约定)），以及文本框的排版方向、字号与每次重算；对外暴露
+  `set_image()`、`image()`、`set_rois()` / `rois()`、`select_roi_item()`、
+  `set_hand_mode()`、`set_text_direction()`、`set_text_font_size()`、
+  `begin_text_edit()` / `commit_text_edit()` / `cancel_text_edit()`，以及
+  `zoomChanged`、`roisChanged`、`roiTextChanged`、`textFontChanged`、
+  `textFontLimitReached`、`selectionChanged` 信号。
 - **`roi_item.py` / `RoiItem`**：单个矩形的外观与交互（`ItemIsMovable` + 八个手柄），
   用 `mapRectToScene()` 与图像坐标互转；另外挂着这个框的 OCR 文本（`text()` / `set_text()`），
-  文本由上层编辑好后写回。手柄是它的子图元，对 `ImageView` 透明。
+  文本由上层编辑好后写回。手柄与文本框都是它的子图元，对 `ImageView` 透明；
+  `setRect()` 被重写，改几何时顺带把两类子图元同步过去。
+- **`text_box.py`**：标注旁那个小框。`TextDirection` 是排版方向（横排 / 竖排）这个设定
+  本身，`RoiTextBox` 负责量尺寸、贴边与绘制，只用 QtCore / QtGui 的字体度量与画笔，
+  不含控件；它也持有字号，但"到底能调多大"要问视图喂进来的现场（见下）。
 - **`annotations.py`**：纯数据层，不含任何控件。`Roi` 是四个浮点数加一段可选的识别文本，
   `RoiStore` 管内存缓存与边车文件读写。可在没有界面的场景下单独使用或测试。
 - **`images.py`**：纯函数式的扫描、自然排序与解码，返回 `Path` 列表和 `QImage`，
@@ -145,9 +153,10 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
   界面通过 `MainWindow(ocr_factory=...)` 注入引擎，测试里可以换成假引擎。
 - **`__init__.py` / `__main__.py`**：命令入口，只做转发。
 
-依赖方向单向：`app.py` → `image_view.py` → `roi_item.py` → `annotations.py`，
-另有 `app.py` → `images.py` 与 `app.py` → `ocr.py`。反向引用一律禁止，
-`annotations.py`、`images.py`、`ocr.py` 不依赖任何视图或窗口模块。
+依赖方向单向：`app.py` → `image_view.py` → `roi_item.py` → `text_box.py` →
+`annotations.py`，另有 `app.py` → `images.py`、`app.py` → `ocr.py`、
+`app.py` → `text_box.py`（只为了那个方向设定）。反向引用一律禁止，`annotations.py`、
+`images.py`、`ocr.py`、`text_box.py` 不依赖任何视图或窗口模块。
 
 ## 环境与依赖
 
@@ -189,7 +198,26 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
 - 左键在图像空白处是"拉新矩形"，落在已有图元上则交回场景做选中 / 移动 / 缩放，判断在
   `ImageView._begin_roi()`。不可见的图元（未选中图元的手柄）不会参与命中，这是 Qt 的行为，
   依赖它比依赖 `isVisible()` 自己过滤更可靠。双击另走 `ImageView.mouseDoubleClickEvent()`
-  （命中手柄时上溯到父图元），不经过场景。
+  （命中手柄或文本框时上溯到父图元），不经过场景。
+- **标注旁的文本框**：`RoiTextBox` 是 `RoiItem` 的子图元（不是在场景里另挂一批），
+  这样"跟着标注移动 / 缩放 / 删除"和"只有选中才显示"都由 Qt 的父子关系与
+  `ItemSelectedHasChanged` 白送，视图不必维护任何映射表。它带
+  `ItemIgnoresTransformations`：位置锚在标注的角上（父坐标，图像像素），自身尺寸却是
+  屏幕像素，所以缩放画布时框的字号不变、也不会跑偏。内容往哪个方向铺由
+  `set_after()` 决定（横排 = 下方、竖排 = 右侧；反方向的内容用负坐标），"离标注一个固定
+  屏幕空隙"因此不需要知道画布缩放。
+- **文本框的尺寸与贴边：视图说、图元摆、框来量**。视图是唯一知道画布缩放与视口大小
+  的地方，所以每次重算（选中、缩放、改变窗口大小、滚动、拖动中与拖动结束）都由
+  `ImageView._sync_text_boxes()` 把"标注在屏幕上的矩形 + 视口 + 字号"喂给
+  `RoiItem.update_text_box()`；图元据此算好横排/竖排的对齐尺寸与两侧余量，交给
+  `RoiTextBox` 量文字、决定尺寸，再按"能整框放下的一侧优先、否则余量大的一侧"摆好锚点。
+  - **对齐规则**：横排的框宽 = 标注的屏幕宽、竖排的框高 = 标注的屏幕高，前提是标注
+    自己要塞得下一个字、且这个尺寸不超出视口；否则退回按文字自然大小排（横排上限
+    `MAX_LINE_WIDTH`、竖排上限 `MAX_COLUMN_HEIGHT`）。提示文字（`EMPTY_HINT`）不参与
+    对齐，免得空框也被撑成一条。
+  - **字号上限**：`RoiTextBox.fits_font_size()` 用候选字号重排一次，检查整框是否还在
+    余量与视口内；装不下就不允许再调大（`ImageView._adjust_text_font()`）。余量是
+    "排版轴两侧的较大者"，所以判据与框宽无关，滚动、缩放时重算很便宜。
 - **文本就地编辑**：编辑器是 `ImageView.viewport()` 的子控件，用屏幕坐标贴在 ROI 上，
   所以画布缩放到 2% 或 4000% 输入手感都一样（`ItemIgnoresTransformations` 的那套只解决
   绘制，管不了输入控件）。采纳时先 `RoiItem.set_text()` 再发 `roiTextChanged`；这个信号与
@@ -197,6 +225,15 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
   上层在 `_flush_rois()`、`_save_rois()`、`_start_ocr()` 开头都会 `commit_text_edit()`，
   所以切图、`Ctrl+S`、识别之前正在敲的字不会丢；`_finalize_ocr()` 则先 `cancel_text_edit()`，
   让识别结果说了算，避免编辑器里的旧文本在收尾时盖回去。
+- **`RoiItem.setRect()` 是子图元的同步点**：`QGraphicsRectItem.setRect()` 不会通知子图元，
+  画新框（`ImageView._resize_drawing()` 直接调 `setRect()`）时手柄和文本框会留在旧位置，
+  所以 `RoiItem` 重写了它，一次把手柄与文本框都摆好。以后再加"挂在矩形上的东西"，
+  同步逻辑加在这一处，别散到调用方。
+- **排版的边界**：竖排是按字符逐格摆放的（原文里的换行就是换列），不做日语竖排里"ー、（）"这类
+  需要旋转的处理，拉丁字母也不转 90°。Qt 的 `QTextLayout` 没有竖排模式，要支持上面这些
+  细节得另找排版引擎或自己做字符旋转，目前按"识别结果以中日文为主"取舍；横排交给
+  `QFontMetrics.boundingRect()` / `QPainter.drawText()` 的 `TextWordWrap`，
+  尺寸和绘制用的是同一套规则。
 - **空格抓手模式**：`ImageView` 只提供 `hand_mode` / `set_hand_mode()` 开关，按键本身由
   `MainWindow.eventFilter()` 在**应用级**过滤后转发——空格要区分按下与松开两个时刻，
   且焦点可能不在视图上（刚点过右侧结果面板），只写 `ImageView.keyPressEvent` 会漏掉
@@ -235,6 +272,13 @@ ROI 相关的部分自己造 `QMouseEvent` 并带上按键状态——`QTest.mou
 `Esc` 放弃不留痕、没识别过的标注也能编辑、编辑到一半切图或 `Ctrl+S` 会先收下正在敲的
 字、双击空白处不打开编辑器，以及结果面板文本列可编辑（`editItem` 走真实的代理编辑器）、
 改完写回图元并落盘、编辑中遇到面板重填不崩。
+
+文本框的覆盖：没选中不显示、选中后框里有识别文本、框不算标注、横排贴上下且框宽 = 标注的
+屏幕宽（拖手柄改标注宽度后立刻跟着对齐）、竖排贴左右且框高 = 标注的屏幕高、标注太小或
+排不下时退回文字自然大小、脱离视图时有兜底贴边、方向写进 `QSettings` 且菜单勾选同步、
+空文本显示提示、超长文本截断加省略号，以及点框不会在下面拉出新标注、双击框能编辑对应
+的标注。字号另有覆盖：框上滚轮只改字号不缩放、字号变大后框跟着变大且仍然与标注对齐、
+一直调大到"再大一档就放不下"被拒绝并提示、调不回比默认更小、设置里的字号会被夹回范围。
 
 OCR 部分**不加载真模型**：`MainWindow(ocr_factory=...)` 注入 `FakeOcrEngine`，
 覆盖裁剪尺寸与越界处理、模型注册表、`QImage` → PIL 接线（把假的 `manga_ocr` 模块塞进

@@ -115,7 +115,7 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 │   ├── __init__.py             # main() 入口
 │   ├── __main__.py             # python -m ocr_proofread
 │   ├── app.py                  # 主窗口：菜单、快捷键、打开/切换图像、标注存取、OCR 调度
-│   ├── image_view.py           # QGraphicsView 子类：显示、缩放、平移、左键框选
+│   ├── image_view.py           # QGraphicsView 子类：显示、缩放、平移（中键 / 空格抓手）、左键框选
 │   ├── roi_item.py             # 场景里的矩形图元：选中、移动、八向手柄缩放、带识别文本
 │   ├── annotations.py          # Roi 数据结构 + RoiStore（内存缓存＋JSON 边车文件）
 │   ├── images.py               # 图像扫描、自然排序、读取（无界面依赖）
@@ -128,7 +128,8 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
   识别模型通过 `QSettings` 持久化。
 - **`image_view.py` / `ImageView`**：只负责当前这张图的变换（缩放、平移）、场景管理，
   以及"左键在图像空白处拉矩形"的交互；对外暴露 `set_image()`、`image()`、`set_rois()` /
-  `rois()`、`select_roi_item()`，以及 `zoomChanged`、`roisChanged`、`selectionChanged` 信号。
+  `rois()`、`select_roi_item()`、`set_hand_mode()`，以及 `zoomChanged`、`roisChanged`、
+  `selectionChanged` 信号。
 - **`roi_item.py` / `RoiItem`**：单个矩形的外观与交互（`ItemIsMovable` + 八个手柄），
   用 `mapRectToScene()` 与图像坐标互转；另外挂着这个框的 OCR 文本（`text()` / `set_text()`）。
   手柄是它的子图元，对 `ImageView` 透明。
@@ -185,6 +186,11 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
 - 左键在图像空白处是"拉新矩形"，落在已有图元上则交回场景做选中 / 移动 / 缩放，判断在
   `ImageView._begin_roi()`。不可见的图元（未选中图元的手柄）不会参与命中，这是 Qt 的行为，
   依赖它比依赖 `isVisible()` 自己过滤更可靠。
+- **空格抓手模式**：`ImageView` 只提供 `hand_mode` / `set_hand_mode()` 开关，按键本身由
+  `MainWindow.eventFilter()` 在**应用级**过滤后转发——空格要区分按下与松开两个时刻，
+  且焦点可能不在视图上（刚点过右侧结果面板），只写 `ImageView.keyPressEvent` 会漏掉
+  这些情况。抓手模式下左键按下在 `_begin_roi()` 之前就被拦成平移，所以不会新建矩形、
+  也不会拖动已有图元；过滤器只读不消费（返回 `False`），其他控件照常使用空格。
 - 手柄用 `ItemIgnoresTransformations` 绘制，屏幕尺寸恒为 9px；改动这块要复查极端缩放
   （2% 和 4000%）下的手感。
 - 移动与缩放都被夹在图像矩形内（`RoiItem._bounds`），拖不出画面，也拖不成一条线。
@@ -211,6 +217,8 @@ ROI 相关的部分自己造 `QMouseEvent` 并带上按键状态——`QTest.mou
 场景不会认为在拖图元，测不出移动与缩放。覆盖：左键拖出矩形、误点击不留碎图元、
 切图保存与恢复、拖动本体移动、拖手柄缩放、拖不出图像范围、`Delete` 删除，
 以及 `RoiStore` 的写盘、去重、损坏文件容错、空标注删文件与 `text` 字段的读写。
+空格抓手另有覆盖：按住空格拖动只平移画布（滚动条动了）而不留新标注，从已有图元上
+按下也不改动它，松开空格后左键恢复成拉矩形。
 
 OCR 部分**不加载真模型**：`MainWindow(ocr_factory=...)` 注入 `FakeOcrEngine`，
 覆盖裁剪尺寸与越界处理、模型注册表、`QImage` → PIL 接线（把假的 `manga_ocr` 模块塞进

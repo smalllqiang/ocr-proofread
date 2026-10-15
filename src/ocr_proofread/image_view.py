@@ -36,6 +36,7 @@ class ImageView(QGraphicsView):
     * 滚轮 / Ctrl+滚轮 —— 以鼠标位置为锚点缩放
     * Shift+滚轮 —— 水平滚动，Alt+滚轮 —— 垂直滚动
     * 中键拖动 —— 平移画布
+    * 空格按住 + 左键拖动 —— 平移画布（抓手模式），此时不拉新矩形、也不拖动图元
     * 左键在图像空白处拖动 —— 拉出一个新矩形；落在已有图元上时交给场景，
       即选中 / 拖动 / 拖手柄缩放
     * Esc —— 放弃正在拉的矩形，或取消选中
@@ -70,8 +71,9 @@ class ImageView(QGraphicsView):
         self._image: QImage | None = None
         self._scale = 1.0
         self._auto_fit = True  # 窗口大小变化时是否自动重新适应窗口
-        self._panning = False
+        self._pan_button: Qt.MouseButton | None = None  # 正在平移时按住的键
         self._pan_anchor = QPointF()
+        self._hand_mode = False  # 空格按住：左键拖动 = 平移画布
         self._drawing: RoiItem | None = None  # 正在左键拉出的矩形
         self._draw_origin = QPointF()
 
@@ -103,8 +105,9 @@ class ImageView(QGraphicsView):
         self._item = None
         self._image = None
         self._scale = 1.0
-        self._panning = False
+        self._pan_button = None
         self._drawing = None
+        self._update_cursor()  # 切图打断平移时别把"抓紧"的光标留在屏幕上
         self.resetTransform()
         if image is None or image.isNull():
             self._scene.setSceneRect(0, 0, 0, 0)
@@ -185,6 +188,46 @@ class ImageView(QGraphicsView):
         self._scene.addItem(item)
         return item
 
+    # ------------------------------------------------------------------ 抓手
+
+    @property
+    def hand_mode(self) -> bool:
+        """是否处于抓手模式（按住空格）。
+
+        这个状态由上层在空格按下 / 松开时设置，见 :meth:`set_hand_mode`。
+        """
+        return self._hand_mode
+
+    def set_hand_mode(self, enabled: bool) -> None:
+        """开关抓手模式：开启时左键拖动平移画布，不拉新矩形。
+
+        空格是应用级按键，焦点可能不在视图上（比如刚点过右侧结果面板），视图自己听
+        ``keyPressEvent`` 会漏掉这些情况；所以按键由 ``MainWindow`` 在应用级过滤后
+        转发到这里（见 ``MainWindow.eventFilter``）。
+        """
+        if enabled == self._hand_mode:
+            return
+        self._hand_mode = enabled
+        self._update_cursor()
+
+    def _begin_pan(self, button: Qt.MouseButton, viewport_pos: QPointF) -> None:
+        self._pan_button = button
+        self._pan_anchor = viewport_pos
+        self._update_cursor()
+
+    def _end_pan(self) -> None:
+        self._pan_button = None
+        self._update_cursor()
+
+    def _update_cursor(self) -> None:
+        """按当前状态刷新指针：平移中 = 抓紧，空格按住 = 张手，否则默认。"""
+        if self._pan_button is not None:
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+        elif self._hand_mode:
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.viewport().unsetCursor()
+
     # ------------------------------------------------------------------ 缩放
 
     def fit_to_window(self) -> None:
@@ -256,10 +299,12 @@ class ImageView(QGraphicsView):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.MiddleButton and self._item is not None:
-            self._panning = True
-            self._pan_anchor = event.position()
-            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+        # 空格按住时左键也是抓手，优先于"拉新矩形"和"拖动图元"
+        grabbing = event.button() == Qt.MouseButton.MiddleButton or (
+            event.button() == Qt.MouseButton.LeftButton and self._hand_mode
+        )
+        if self._item is not None and grabbing:
+            self._begin_pan(event.button(), event.position())
             event.accept()
             return
         if event.button() == Qt.MouseButton.LeftButton and self._begin_roi(event.position()):
@@ -272,7 +317,7 @@ class ImageView(QGraphicsView):
             self._resize_drawing(event.position())
             event.accept()
             return
-        if self._panning:
+        if self._pan_button is not None:
             delta = event.position() - self._pan_anchor
             self._pan_anchor = event.position()
             h_bar = self.horizontalScrollBar()
@@ -288,9 +333,8 @@ class ImageView(QGraphicsView):
             self._commit_drawing()
             event.accept()
             return
-        if event.button() == Qt.MouseButton.MiddleButton and self._panning:
-            self._panning = False
-            self.viewport().unsetCursor()
+        if self._pan_button is not None and event.button() == self._pan_button:
+            self._end_pan()
             event.accept()
             return
         super().mouseReleaseEvent(event)

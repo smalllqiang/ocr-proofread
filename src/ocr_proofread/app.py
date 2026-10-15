@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread
+from PySide6.QtCore import QEvent, QObject, QSettings, QSize, Qt, QThread
 from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QImage, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -134,6 +134,9 @@ class MainWindow(QMainWindow):
         self.view.zoomChanged.connect(self._on_zoom_changed)
         self.view.roisChanged.connect(self._update_roi_label)
         self.setCentralWidget(self.view)
+        # 空格是"按住"的修饰键，得知道按下与松开两个时刻；焦点可能不在视图上
+        # （刚点过右侧结果面板），所以装在应用级过滤，见 :meth:`MainWindow.eventFilter`
+        QApplication.instance().installEventFilter(self)
 
         self._label_file = QLabel("未打开图像 —— Ctrl+Shift+O 打开文件夹")
         self._label_roi = QLabel("")
@@ -199,7 +202,7 @@ class MainWindow(QMainWindow):
         )
         self.act_next = self._make_action(
             "下一张(&N)",
-            shortcuts=["Right", "D", "PgDown", "Space"],
+            shortcuts=["Right", "D", "PgDown"],
             slot=self.show_next,
             tip="下一张图像",
         )
@@ -834,7 +837,7 @@ class MainWindow(QMainWindow):
             "\n"
             "浏览\n"
             "  ← / A / PageUp / Backspace          上一张\n"
-            "  → / D / PageDown / Space            下一张\n"
+            "  → / D / PageDown                    下一张\n"
             "  Home / End                          第一张 / 最后一张\n"
             "\n"
             "缩放\n"
@@ -859,8 +862,27 @@ class MainWindow(QMainWindow):
             "\n"
             "鼠标\n"
             "  中键拖动                             平移画布\n"
+            "  空格按住 + 左键拖动                  平移画布（抓手，不新建矩形）\n"
             "  Shift+滚轮 / Alt+滚轮                水平 / 垂直滚动",
         )
+
+    # ------------------------------------------------------------------ 键盘
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt 命名)
+        """把空格键的按下 / 松开转成视图的抓手模式。
+
+        空格是"按住才生效"的修饰键，而焦点可能在结果面板或对话框上（视图收不到
+        ``keyPressEvent``），所以这里在应用级过滤，只读不改：事件照常向下传递，
+        别的控件该用空格还照用。
+        """
+        kind = event.type()
+        if kind == QEvent.Type.WindowDeactivate:
+            self.view.set_hand_mode(False)  # 失焦时收不到 KeyRelease，别把抓手卡住
+        elif kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            pressed = kind == QEvent.Type.KeyPress
+            if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+                self.view.set_hand_mode(pressed)
+        return super().eventFilter(watched, event)
 
     # ------------------------------------------------------------------ 拖放
 

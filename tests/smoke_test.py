@@ -144,7 +144,10 @@ def test_navigation(window: MainWindow, root: Path) -> None:
     QTest.keyClick(window, Qt.Key.Key_Home)
     check("Home 跳到第一张", window._index == 0, f"index={window._index}")
     QTest.keyClick(window, Qt.Key.Key_Space)
-    check("Space 切到下一张", window._index == 1, f"index={window._index}")
+    check("Space 不再切图（改成空格抓手的按键）", window._index == 0,
+          f"index={window._index}")
+    check("「下一张」不再绑定 Space", "Space" not in _shortcut_texts(window.act_next),
+          str(_shortcut_texts(window.act_next)))
 
     # 切换后每张图都应重新适应窗口（整图落在视口内，小图允许被放大铺满）
     check("切图后重新适应窗口：整图仍在视口内", fits_in_viewport(window),
@@ -443,6 +446,88 @@ def test_roi_interaction(window: MainWindow, root: Path) -> None:
     check("重新切回仍是空的", view.roi_count() == 0)
 
 
+def test_hand_mode(window: MainWindow, root: Path) -> None:
+    """空格按住 + 左键拖动 = 平移画布：既不留新标注，也不改动已有图元。"""
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    view = window.view
+    viewport = view.viewport()
+    view.set_rois([])
+    view.fit_to_window()
+    for _ in range(6):  # 放大到画布比视口大，滚动条才有行程
+        view.zoom_in()
+    QApplication.processEvents()
+    h_bar = view.horizontalScrollBar()
+    v_bar = view.verticalScrollBar()
+    check("放大后画布可以滚动", h_bar.maximum() > 0 and v_bar.maximum() > 0,
+          f"max=({h_bar.maximum()}, {v_bar.maximum()})")
+
+    center = viewport.rect().center()
+    start = QPoint(center.x() + 50, center.y() + 40)
+    end = QPoint(center.x() - 50, center.y() - 40)
+
+    # ---- 空白处按住空格拖动：只平移，不留标注
+    h_bar.setValue(h_bar.maximum() // 2)
+    v_bar.setValue(v_bar.maximum() // 2)
+    before = (h_bar.value(), v_bar.value())
+
+    QTest.keyPress(window, Qt.Key.Key_Space)
+    check("按住空格进入抓手模式", view.hand_mode)
+    check("抓手模式下指针是张手",
+          viewport.cursor().shape() == Qt.CursorShape.OpenHandCursor,
+          str(viewport.cursor().shape()))
+    drag(viewport, start, end)
+    after = (h_bar.value(), v_bar.value())
+    check("空格拖动平移了画布", after[0] > before[0] and after[1] > before[1],
+          f"{before} -> {after}")
+    check("空格拖动不新建标注", view.roi_count() == 0, f"count={view.roi_count()}")
+
+    # ---- 从已有图元上按下同样是平移：图元不许被拖动
+    scene_center = view.mapToScene(center)
+    view.set_rois([Roi(scene_center.x() - 20, scene_center.y() - 15, 40, 30)])
+    item = view.roi_items()[0]
+    item.setSelected(True)
+    grip = view.mapFromScene(item.mapRectToScene(item.rect()).center())
+    before_roi = item.to_roi()
+    h_bar.setValue(h_bar.maximum() // 2)
+    v_bar.setValue(v_bar.maximum() // 2)
+    before = (h_bar.value(), v_bar.value())
+    drag(viewport, grip, QPoint(grip.x() - 60, grip.y() - 40))
+    check("空格拖动压过「拖动图元」", same_rois(view.rois(), [before_roi]), str(view.rois()))
+    check("从图元上按下也在平移画布",
+          h_bar.value() > before[0] and v_bar.value() > before[1],
+          f"{before} -> {(h_bar.value(), v_bar.value())}")
+
+    QTest.keyRelease(window, Qt.Key.Key_Space)
+    check("松开空格退出抓手模式", not view.hand_mode)
+    check("退出抓手后指针恢复默认",
+          viewport.cursor().shape() == Qt.CursorShape.ArrowCursor,
+          str(viewport.cursor().shape()))
+
+    # ---- 松开空格后左键恢复成拉矩形
+    view.set_rois([])
+    drag(viewport, start, end)
+    check("松开空格后左键恢复成拉矩形", view.roi_count() == 1, f"count={view.roi_count()}")
+
+    # ---- 焦点不在视图上也要能进抓手（这就是按键走应用级过滤的原因）
+    view.set_rois([])
+    window._panel.setFocus()
+    QApplication.processEvents()
+    check("焦点在结果面板上", window._panel.hasFocus())
+    QTest.keyPress(window, Qt.Key.Key_Space)
+    check("焦点不在视图上也能进入抓手", view.hand_mode)
+    grab = viewport.rect().center()
+    drag(viewport, QPoint(grab.x() + 30, grab.y()), QPoint(grab.x() - 30, grab.y()))
+    check("面板有焦点时空格拖动同样不留标注", view.roi_count() == 0,
+          f"count={view.roi_count()}")
+    QTest.keyRelease(window, Qt.Key.Key_Space)
+    check("松开空格后退出抓手", not view.hand_mode)
+
+
 def _fake_manga_ocr_run(image: QImage) -> tuple[str, dict]:
     """用假的 ``manga_ocr`` 模块走一遍 :class:`MangaOcrEngine`，验证接线。
 
@@ -696,6 +781,7 @@ def main() -> int:
         test_zoom(window)
         test_broken_image(window, root)
         test_roi_interaction(window, root)
+        test_hand_mode(window, root)
         test_ocr_workflow(window, root, engine)
         test_ocr_cancel(window, root, engine)
         test_ocr_merge(window, root)

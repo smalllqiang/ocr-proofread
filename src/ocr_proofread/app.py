@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
 )
@@ -103,11 +104,22 @@ def _same_rect(left, right) -> bool:
     )
 
 
-def _table_cell(text: str) -> QTableWidgetItem:
-    """OCR 结果面板里的只读单元格。"""
+def _table_cell(text: str, *, editable: bool = False) -> QTableWidgetItem:
+    """OCR 结果面板里的单元格；只有识别文本那一列允许编辑。"""
     cell = QTableWidgetItem(text)
-    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+    if not editable:
+        cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
     return cell
+
+
+class _RoiTextDelegate(QStyledItemDelegate):
+    """识别文本列的显示代理：没识别过（空串）显示成「—」，双击编辑时是空串。
+
+    底层数据只存一份文本，占位符只在绘制时出现，所以"清空文本"不会被写进「—」。
+    """
+
+    def displayText(self, value, locale) -> str:  # noqa: N802 (Qt 命名)
+        return str(value) if value else "—"
 
 
 class MainWindow(QMainWindow):
@@ -267,11 +279,16 @@ class MainWindow(QMainWindow):
         )
 
     def _create_ocr_panel(self) -> None:
-        """右侧的 OCR 结果面板：一行一个 ROI，点行选中对应的框。"""
+        """右侧的 OCR 结果面板：一行一个 ROI，点行选中对应的框，双击文本可改。"""
         self._panel = QTableWidget(0, 3, self)
         self._panel.setHorizontalHeaderLabels(["#", "位置 / 尺寸", "识别文本"])
         self._panel.verticalHeader().setVisible(False)
-        self._panel.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        # 只有识别文本一列是可编辑的（单元格自身的 ItemIsEditable 标志决定），
+        # 双击（或 F2）进入编辑，改完写回图元并落盘
+        self._panel.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
         self._panel.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._panel.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._panel.setWordWrap(True)  # 识别文本宁可换行也不要被省略号截掉
@@ -279,7 +296,9 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._panel.setItemDelegateForColumn(2, _RoiTextDelegate(self._panel))
         self._panel.itemSelectionChanged.connect(self._on_panel_selection_changed)
+        self._panel.itemChanged.connect(self._on_panel_item_changed)
 
         dock = QDockWidget("OCR 结果", self)
         dock.setObjectName("ocr_panel")
@@ -298,6 +317,7 @@ class MainWindow(QMainWindow):
 
         self.view.roisChanged.connect(self._refresh_ocr_panel)
         self.view.roisChanged.connect(self._update_actions)
+        self.view.roiTextChanged.connect(self._on_roi_text_changed)
         self.view.selectionChanged.connect(self._sync_panel_selection)
         self.view.selectionChanged.connect(self._update_actions)
 
@@ -492,8 +512,10 @@ class MainWindow(QMainWindow):
         """把场景里的标注写回当前这张图；没有图像时什么都不做。
 
         每次切图、重新打开文件夹、关闭窗口都会调用；:class:`RoiStore` 只在内容
-        真的变了才落盘，所以没标注过的图不会多出文件。
+        真的变了才落盘，所以没标注过的图不会多出文件。开头先收掉正在就地编辑的
+        文本框，正在改的字才不会随着场景一起消失。
         """
+        self.view.commit_text_edit()
         path = self._current_path()
         if path is None or not self.view.has_image:
             return
@@ -507,6 +529,7 @@ class MainWindow(QMainWindow):
         path = self._current_path()
         if path is None:
             return
+        self.view.commit_text_edit()  # 正在手改的文本也要一起存下去
         try:
             self._roi_store.set(path, self.view.rois())
         except OSError as exc:
@@ -597,6 +620,7 @@ class MainWindow(QMainWindow):
         image = self.view.image()
         if path is None or image is None or self._ocr_job is not None:
             return
+        self.view.commit_text_edit()  # 正在手改的文本先收下来，别被识别结果冲掉
 
         items = [
             item
@@ -680,6 +704,7 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
         if self._current_path() == job.path:
+            self.view.cancel_text_edit()  # 识别结果说了算，别让在改的旧文本盖回来
             applied = 0
             for index, item in enumerate(job.items):
                 text = job.task.results.get(index)
@@ -757,7 +782,7 @@ class MainWindow(QMainWindow):
                     ),
                 )
                 text = item.text()
-                cell = _table_cell(text or "—")
+                cell = _table_cell(text, editable=True)
                 cell.setToolTip(text)
                 self._panel.setItem(row, 2, cell)
             self._panel.resizeRowsToContents()  # 换行后的行高
@@ -794,6 +819,36 @@ class MainWindow(QMainWindow):
         item = self._panel_items[row]
         if not item.isSelected():
             self.view.select_roi_item(item)
+
+    def _on_panel_item_changed(self, cell: QTableWidgetItem) -> None:
+        """在结果面板里双击改完文本：写回对应的图元并立刻落盘。
+
+        这里不回填面板（内容已经是用户刚输入的那份），只同步图元、状态栏与文件，
+        免得在表格自己的 ``itemChanged`` 回调里重造正在编辑的单元格。
+        """
+        if cell.column() != 2:
+            return
+        row = cell.row()
+        if not 0 <= row < len(self._panel_items):
+            return
+        item = self._panel_items[row]
+        if item.scene() is None:
+            return  # 图元已经随切图消失了
+        text = cell.text()
+        if text == item.text():
+            return
+        item.set_text(text)
+        self._flush_rois()
+        self._update_roi_label()
+
+    def _on_roi_text_changed(self) -> None:
+        """画布上双击改完文本：立刻落盘并刷新面板与状态栏。
+
+        与识别结果一样"不用等切图就在文件里"，因为文本是用户手工敲的，丢了没法重来。
+        """
+        self._flush_rois()
+        self._refresh_ocr_panel()
+        self._update_roi_label()
 
     # ------------------------------------------------------------------ 状态
 
@@ -849,6 +904,8 @@ class MainWindow(QMainWindow):
             "标注\n"
             "  左键在图像上拖动                     拉出一个矩形标注\n"
             "  左键拖动图元 / 拖动手柄              移动 / 缩放标注\n"
+            "  双击图元 或 双击结果面板的文本       编辑该 ROI 的识别文本\n"
+            "                                        （Esc 放弃，Ctrl+Enter 或点开别处采纳）\n"
             "  Delete                              删除选中的标注\n"
             "  Ctrl+S                              保存当前图的标注\n"
             "  Esc                                 放弃正在拉的矩形 / 取消选中\n"

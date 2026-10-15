@@ -5,9 +5,10 @@
 
 ## 设计边界
 
-当前版本做"浏览 + 框选 + 每图标注存取 + OCR 识别"：打开图像、缩放平移、上下张切换、
-左键拖出矩形并调整、切图时自动保存与恢复标注，以及对选中的或全部的 ROI 跑识别、
-把文本挂在对应的 ROI 上一起落盘。识别文本的编辑、校对与导出不在范围内。
+当前版本做"浏览 + 框选 + 每图标注存取 + OCR 识别 + 文本编辑"：打开图像、缩放平移、上下张
+切换、左键拖出矩形并调整、切图时自动保存与恢复标注，对选中的或全部的 ROI 跑识别、
+把文本挂在对应的 ROI 上一起落盘，并且可以双击就地改掉这段文本。批量替换、逐字校对与
+导出等更完整的校对工作流不在范围内。
 
 由此定下两条贯穿全项目的原则：
 
@@ -72,14 +73,15 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 ## 标注数据的生命周期
 
 ```
-切图 / 关窗 / Ctrl+S / 识别完成    场景 ──ImageView.rois()──▶ RoiStore.set(图像路径, 标注)
+切图 / 关窗 / Ctrl+S / 识别完成 / 文本编辑被采纳    场景 ──ImageView.rois()──▶ RoiStore.set(图像路径, 标注)
                                                               │ 内容有变化才写盘
                                                               ▼
                                                  <图像文件名>.roi.json（原子替换）
 ```
 
-- **落盘时机**：切上一张 / 下一张、重新打开一组图像、关窗、`Ctrl+S`，以及一批识别结束
-  （`_finalize_ocr()` 会立刻 `_flush_rois()`），所以识别结果不用等切图就已经在文件里了。
+- **落盘时机**：切上一张 / 下一张、重新打开一组图像、关窗、`Ctrl+S`、一批识别结束
+  （`_finalize_ocr()` 会立刻 `_flush_rois()`），以及一次文本编辑被采纳（`roiTextChanged`
+  → `_flush_rois()`），所以识别结果和手改的字都不用等切图就已经在文件里了。
   空标注不落盘，已存在的边车文件会被删除，所以从没标过的图不会多出文件。
 - **`RoiStore` 是唯一读写标注文件的地方**：内存缓存 + 惰性读盘，内容没变就不碰磁盘，
   因此反复翻页不会反复写文件，也不会把 mtime 刷得满天飞。
@@ -124,14 +126,16 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 
 - **`app.py` / `MainWindow`**：唯一持有"图像列表 + 当前索引 + 标注存储 + OCR 任务"的地方。
   菜单、快捷键、拖放、命令行参数最终都汇入 `open_paths()`。窗口大小、上次目录与上次用的
-  识别模型通过 `QSettings` 持久化。
+  识别模型通过 `QSettings` 持久化；结果面板里双击改文本也在这里收口（`_on_panel_item_changed`）。
 - **`image_view.py` / `ImageView`**：只负责当前这张图的变换（缩放、平移）、场景管理，
-  以及"左键在图像空白处拉矩形"的交互；对外暴露 `set_image()`、`image()`、`set_rois()` /
-  `rois()`、`select_roi_item()`、`set_hand_mode()`，以及 `zoomChanged`、`roisChanged`、
-  `selectionChanged` 信号。
+  "左键在图像空白处拉矩形"的交互，以及双击图元后的文本就地编辑（编辑器是视口的子控件，
+  见 [扩展点与约定](#扩展点与约定)）；对外暴露 `set_image()`、`image()`、`set_rois()` /
+  `rois()`、`select_roi_item()`、`set_hand_mode()`、`begin_text_edit()` /
+  `commit_text_edit()` / `cancel_text_edit()`，以及 `zoomChanged`、`roisChanged`、
+  `roiTextChanged`、`selectionChanged` 信号。
 - **`roi_item.py` / `RoiItem`**：单个矩形的外观与交互（`ItemIsMovable` + 八个手柄），
-  用 `mapRectToScene()` 与图像坐标互转；另外挂着这个框的 OCR 文本（`text()` / `set_text()`）。
-  手柄是它的子图元，对 `ImageView` 透明。
+  用 `mapRectToScene()` 与图像坐标互转；另外挂着这个框的 OCR 文本（`text()` / `set_text()`），
+  文本由上层编辑好后写回。手柄是它的子图元，对 `ImageView` 透明。
 - **`annotations.py`**：纯数据层，不含任何控件。`Roi` 是四个浮点数加一段可选的识别文本，
   `RoiStore` 管内存缓存与边车文件读写。可在没有界面的场景下单独使用或测试。
 - **`images.py`**：纯函数式的扫描、自然排序与解码，返回 `Path` 列表和 `QImage`，
@@ -184,7 +188,15 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
   但读回时要注意 `pos` 与 `rect` 的拆分。
 - 左键在图像空白处是"拉新矩形"，落在已有图元上则交回场景做选中 / 移动 / 缩放，判断在
   `ImageView._begin_roi()`。不可见的图元（未选中图元的手柄）不会参与命中，这是 Qt 的行为，
-  依赖它比依赖 `isVisible()` 自己过滤更可靠。
+  依赖它比依赖 `isVisible()` 自己过滤更可靠。双击另走 `ImageView.mouseDoubleClickEvent()`
+  （命中手柄时上溯到父图元），不经过场景。
+- **文本就地编辑**：编辑器是 `ImageView.viewport()` 的子控件，用屏幕坐标贴在 ROI 上，
+  所以画布缩放到 2% 或 4000% 输入手感都一样（`ItemIgnoresTransformations` 的那套只解决
+  绘制，管不了输入控件）。采纳时先 `RoiItem.set_text()` 再发 `roiTextChanged`；这个信号与
+  `roisChanged` 分开——前者是"文本内容变了、该落盘"，后者是"图元增删了、面板要重填"。
+  上层在 `_flush_rois()`、`_save_rois()`、`_start_ocr()` 开头都会 `commit_text_edit()`，
+  所以切图、`Ctrl+S`、识别之前正在敲的字不会丢；`_finalize_ocr()` 则先 `cancel_text_edit()`，
+  让识别结果说了算，避免编辑器里的旧文本在收尾时盖回去。
 - **空格抓手模式**：`ImageView` 只提供 `hand_mode` / `set_hand_mode()` 开关，按键本身由
   `MainWindow.eventFilter()` 在**应用级**过滤后转发——空格要区分按下与松开两个时刻，
   且焦点可能不在视图上（刚点过右侧结果面板），只写 `ImageView.keyPressEvent` 会漏掉
@@ -218,6 +230,11 @@ ROI 相关的部分自己造 `QMouseEvent` 并带上按键状态——`QTest.mou
 以及 `RoiStore` 的写盘、去重、损坏文件容错、空标注删文件与 `text` 字段的读写。
 空格抓手另有覆盖：按住空格拖动只平移画布（滚动条动了）而不留新标注，从已有图元上
 按下也不改动它，松开空格后左键恢复成拉矩形。
+
+文本编辑的覆盖：双击图元打开就地编辑器并带出原文本、`Ctrl+Enter` 采纳后立刻落盘、
+`Esc` 放弃不留痕、没识别过的标注也能编辑、编辑到一半切图或 `Ctrl+S` 会先收下正在敲的
+字、双击空白处不打开编辑器，以及结果面板文本列可编辑（`editItem` 走真实的代理编辑器）、
+改完写回图元并落盘、编辑中遇到面板重填不崩。
 
 OCR 部分**不加载真模型**：`MainWindow(ocr_factory=...)` 注入 `FakeOcrEngine`，
 覆盖裁剪尺寸与越界处理、模型注册表、`QImage` → PIL 接线（把假的 `manga_ocr` 模块塞进

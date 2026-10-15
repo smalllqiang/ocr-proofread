@@ -1,4 +1,4 @@
-"""QGraphicsView 子类：显示单张图像，负责缩放、平移与 ROI 框选。
+"""QGraphicsView 子类：显示单张图像，负责缩放、平移、ROI 框选与文本就地编辑。
 
 ``set_image()`` 会清空整个场景，ROI 图元随之消失；切图后需要由上层重新调用
 :meth:`ImageView.set_rois`。视图不保存跨图状态，只持有"当前这一张图"。
@@ -6,14 +6,22 @@
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Callable, Iterable
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QImage, QPainter, QPixmap, QTransform, QWheelEvent
+from PySide6.QtGui import (
+    QImage,
+    QPainter,
+    QPixmap,
+    QTextCursor,
+    QTransform,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
+    QPlainTextEdit,
     QWidget,
 )
 
@@ -27,6 +35,59 @@ MAX_SCALE = 40.0
 #: 鼠标滚轮 / 快捷键单步缩放倍率
 ZOOM_STEP = 1.25
 
+#: 就地文本编辑器的最小尺寸（屏幕像素）；小的 ROI 也要能编辑得下去
+TEXT_EDITOR_MIN_WIDTH = 160
+TEXT_EDITOR_MIN_HEIGHT = 64
+
+
+class _RoiTextEditor(QPlainTextEdit):
+    """盖在 ROI 上的就地文本编辑器。
+
+    编辑器是视口的子控件，坐标与尺寸都用屏幕像素，所以画布缩放到多少都不影响
+    输入手感。它只负责把"编辑结束"的三种方式转成一次 ``done(commit)`` 回调：
+
+    * ``Esc`` —— 放弃（``commit=False``）
+    * ``Ctrl+Enter`` —— 采纳（``commit=True``）
+    * 焦点离开（点了别处 / Tab 走）—— 采纳
+    """
+
+    def __init__(self, parent: QWidget, done: Callable[[bool], None]) -> None:
+        super().__init__(parent)
+        self._done = done
+        self._finished = False
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setTabChangesFocus(True)  # Tab 用来离开编辑器而不是插制表符
+        self.setStyleSheet(
+            "QPlainTextEdit {"
+            " background: #fffdf5;"
+            " border: 2px solid #ff6d00;"
+            " padding: 2px;"
+            " selection-background-color: #ffcc80;"
+            "}"
+        )
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        if event.key() == Qt.Key.Key_Escape:
+            self._finish(commit=False)
+            return
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            self._finish(commit=True)
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        super().focusOutEvent(event)
+        self._finish(commit=True)
+
+    def _finish(self, *, commit: bool) -> None:
+        """结束编辑，保证回调只发一次（Esc 之后紧接着的 focusOut 是空操作）。"""
+        if self._finished:
+            return
+        self._finished = True
+        self._done(commit)
+
 
 class ImageView(QGraphicsView):
     """一张图 + 缩放 + 平移 + ROI 框选。
@@ -39,6 +100,7 @@ class ImageView(QGraphicsView):
     * 空格按住 + 左键拖动 —— 平移画布（抓手模式），此时不拉新矩形、也不拖动图元
     * 左键在图像空白处拖动 —— 拉出一个新矩形；落在已有图元上时交给场景，
       即选中 / 拖动 / 拖手柄缩放
+    * 双击已有图元 —— 就地编辑这个 ROI 的文本（见 :meth:`begin_text_edit`）
     * Esc —— 放弃正在拉的矩形，或取消选中
     """
 
@@ -47,6 +109,9 @@ class ImageView(QGraphicsView):
 
     #: 场景里的 ROI 数量发生变化（新增、删除、整批替换）时发出；移动与缩放不发
     roisChanged = Signal()
+
+    #: 就地编辑文本被采纳时发出（放弃编辑、没有改动时不发）
+    roiTextChanged = Signal()
 
     #: 场景里的选中状态变化（选中 / 取消选中 / 改选另一个）时发出
     selectionChanged = Signal()
@@ -76,6 +141,10 @@ class ImageView(QGraphicsView):
         self._hand_mode = False  # 空格按住：左键拖动 = 平移画布
         self._drawing: RoiItem | None = None  # 正在左键拉出的矩形
         self._draw_origin = QPointF()
+        self._text_editor: _RoiTextEditor | None = None  # 双击图元后盖上去的编辑器
+        self._text_item: RoiItem | None = None  # 编辑器正在改的那个图元
+        # 缩放后编辑器要跟着 ROI 挪，否则输入框会留在原地
+        self.zoomChanged.connect(lambda _scale: self._place_text_editor())
 
     # ------------------------------------------------------------------ 图像
 
@@ -101,6 +170,7 @@ class ImageView(QGraphicsView):
         注意：这里会清空整个场景，其中的 ROI 图元会一并被移除。切图后由上层
         重新调用 :meth:`set_rois` 恢复该图的标注。
         """
+        self.cancel_text_edit()  # 编辑器挂在图元上，图元要没了就先撤掉
         self._scene.clear()
         self._item = None
         self._image = None
@@ -149,6 +219,7 @@ class ImageView(QGraphicsView):
 
     def set_rois(self, rois: Iterable[Roi]) -> None:
         """清掉现有 ROI，换成给定的这一批；由上层在切图后调用。"""
+        self.cancel_text_edit()
         for item in self.roi_items():
             self._scene.removeItem(item)
         for roi in rois:
@@ -157,6 +228,7 @@ class ImageView(QGraphicsView):
 
     def clear_rois(self) -> None:
         """删除当前图像上的所有 ROI。"""
+        self.cancel_text_edit()
         items = self.roi_items()
         for item in items:
             self._scene.removeItem(item)
@@ -165,6 +237,7 @@ class ImageView(QGraphicsView):
 
     def delete_selected_rois(self) -> int:
         """删除选中的 ROI，返回删掉的数量。"""
+        self.cancel_text_edit()
         selected = [item for item in self.roi_items() if item.isSelected()]
         for item in selected:
             self._scene.removeItem(item)
@@ -187,6 +260,88 @@ class ImageView(QGraphicsView):
         item = RoiItem(rect, bounds=bounds if not bounds.isEmpty() else None, text=text)
         self._scene.addItem(item)
         return item
+
+    # ---------------------------------------------------------------- 文本编辑
+
+    def is_editing_text(self) -> bool:
+        """当前是否有一个 ROI 正在就地编辑文本。"""
+        return self._text_editor is not None
+
+    def begin_text_edit(self, item: RoiItem) -> bool:
+        """在给定 ROI 上盖一个就地编辑器并让它拿到焦点。
+
+        返回是否真的开始编辑；一次只编辑一个框，已经在编辑别的框时先采纳前一个。
+        文本只在结束时（:meth:`commit_text_edit`）写回图元，中途的输入不影响场景。
+        """
+        if item.scene() is not self._scene:
+            return False
+        self.commit_text_edit()
+        self._scene.clearSelection()
+        item.setSelected(True)
+
+        editor = _RoiTextEditor(self.viewport(), self._finish_text_edit)
+        editor.setPlainText(item.text())
+        self._text_editor = editor
+        self._text_item = item
+        self._place_text_editor()
+        editor.show()
+        editor.setFocus(Qt.FocusReason.MouseFocusReason)
+        cursor = editor.textCursor()  # 光标落在末尾：接着原文改，而不是覆盖
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        editor.setTextCursor(cursor)
+        return True
+
+    def commit_text_edit(self) -> bool:
+        """采纳正在编辑的文本（并发出 :attr:`roiTextChanged`）；没在编辑时返回 ``False``。
+
+        切图 / 保存 / 关窗前由上层调用，免得"正在改的字"随场景一起消失。
+        """
+        if self._text_editor is None:
+            return False
+        self._finish_text_edit(True)
+        return True
+
+    def cancel_text_edit(self) -> bool:
+        """放弃正在编辑的文本，保持原样；没在编辑时返回 ``False``。"""
+        if self._text_editor is None:
+            return False
+        self._finish_text_edit(False)
+        return True
+
+    def _finish_text_edit(self, commit: bool) -> None:
+        """收起编辑器：``commit`` 为真才把文本写回图元。
+
+        先把 ``_text_editor`` 置空再动图元，所以这里发信号引起的重入（比如上层
+        收到 ``roiTextChanged`` 后又来 ``commit_text_edit()``）会立刻返回，不会绕回来。
+        """
+        editor, item = self._text_editor, self._text_item
+        if editor is None:
+            return
+        self._text_editor = None
+        self._text_item = None
+        text = editor.toPlainText()
+        editor.hide()
+        editor.deleteLater()
+
+        if item is None or item.scene() is not self._scene:
+            return  # 图元已经被删掉了（比如编辑期间切了图），只收掉编辑器
+        if not commit or text == item.text():
+            return
+        item.set_text(text)
+        self.roiTextChanged.emit()
+
+    def _place_text_editor(self) -> None:
+        """把编辑器摆到 ROI 在屏幕上的位置上，小的 ROI 用最小尺寸兜底。"""
+        editor, item = self._text_editor, self._text_item
+        if editor is None or item is None:
+            return
+        area = self.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+        viewport = self.viewport().rect()
+        width = min(max(area.width(), TEXT_EDITOR_MIN_WIDTH), viewport.width())
+        height = min(max(area.height(), TEXT_EDITOR_MIN_HEIGHT), viewport.height())
+        x = min(max(area.left(), 0), max(viewport.width() - width, 0))
+        y = min(max(area.top(), 0), max(viewport.height() - height, 0))
+        editor.setGeometry(int(x), int(y), int(width), int(height))
 
     # ------------------------------------------------------------------ 抓手
 
@@ -272,6 +427,7 @@ class ImageView(QGraphicsView):
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         super().resizeEvent(event)
+        self._place_text_editor()  # 编辑器是屏幕坐标的，窗口变了要重新贴回 ROI
         if self._auto_fit:
             self.fit_to_window()
 
@@ -299,6 +455,8 @@ class ImageView(QGraphicsView):
         event.accept()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        # 画布上任何一次按下都先结束就地编辑：接着要移动图元或拉新矩形了
+        self.commit_text_edit()
         # 空格按住时左键也是抓手，优先于"拉新矩形"和"拖动图元"
         grabbing = event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton and self._hand_mode
@@ -311,6 +469,17 @@ class ImageView(QGraphicsView):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
+        """双击已有图元 → 就地编辑它的文本；其余情况照常交给场景。"""
+        if event.button() == Qt.MouseButton.LeftButton and not self._hand_mode:
+            target = self.itemAt(event.position().toPoint())
+            if isinstance(target, RoiHandle):  # 手柄也算所在的那个框
+                target = target.parentItem()
+            if isinstance(target, RoiItem) and self.begin_text_edit(target):
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
         if self._drawing is not None:
@@ -341,6 +510,9 @@ class ImageView(QGraphicsView):
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
+            if self.cancel_text_edit():  # 焦点不在编辑器上时的兜底
+                event.accept()
+                return
             if self._drawing is not None:
                 self._cancel_drawing()
                 event.accept()

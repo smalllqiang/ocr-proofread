@@ -242,7 +242,7 @@ class RoiItem(QGraphicsRectItem):
             handle.setPos(rect.left() + fx * rect.width(), rect.top() + fy * rect.height())
 
     def _apply_tooltip(self) -> None:
-        hint = "拖动移动，拖动方块手柄缩放，Delete 删除"
+        hint = "拖动移动，拖动方块手柄缩放，双击编辑文本，Delete 删除"
         self.setToolTip(f"{self._text}\n\n{hint}" if self._text else hint)
 
     def _apply_pen(self) -> None:

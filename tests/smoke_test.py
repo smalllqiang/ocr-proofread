@@ -1,7 +1,8 @@
 """无界面冒烟测试：不需要 pytest，直接 ``uv run python tests/smoke_test.py``。
 
 覆盖：文件夹扫描与自然排序、打开/切换图像、缩放范围、快捷键绑定、ROI 框选与
-标注存取、OCR（裁剪 / 引擎接线 / 后台任务 / 结果落盘）以及坏图不让程序崩溃。
+标注存取、双击编辑识别文本、OCR（裁剪 / 引擎接线 / 后台任务 / 结果落盘）
+以及坏图不让程序崩溃。
 
 OCR 部分注入一个假引擎（``MainWindow(ocr_factory=...)``），所以这里不会加载 torch，
 也不会去 HuggingFace 下载模型——真正跑 manga-ocr 的手动验证见 README。
@@ -26,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QAbstractItemView, QApplication, QLineEdit  # noqa: E402
 
 from ocr_proofread.annotations import (  # noqa: E402
     Roi,
@@ -528,6 +529,134 @@ def test_hand_mode(window: MainWindow, root: Path) -> None:
     check("松开空格后退出抓手", not view.hand_mode)
 
 
+def _double_click(widget, pos: QPoint) -> None:
+    """往 widget 送一个双击事件（走真实的事件处理）。"""
+    _send_mouse(
+        widget,
+        QEvent.Type.MouseButtonDblClick,
+        pos,
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+    )
+
+
+def test_text_edit(window: MainWindow, root: Path) -> None:
+    """双击图元 / 双击结果面板都能改 ROI 的 text 字段，并且立刻落盘。"""
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    view = window.view
+    viewport = view.viewport()
+    view.set_rois([Roi(20, 20, 60, 30, "原始文本"), Roi(120, 50, 40, 25)])
+    view.fit_to_window()
+    QApplication.processEvents()
+
+    def center_of(index: int) -> QPoint:
+        item = view.roi_items()[index]
+        return view.mapFromScene(item.mapRectToScene(item.rect()).center())
+
+    check("默认不在编辑文本", not view.is_editing_text())
+
+    # ---- 双击图元：打开、采纳、落盘、面板同步
+    item = view.roi_items()[0]
+    _double_click(viewport, center_of(0))
+    check("双击图元打开就地编辑器", view.is_editing_text())
+    if not view.is_editing_text():
+        return
+    check("编辑器带出原文本", view._text_editor.toPlainText() == "原始文本",
+          repr(view._text_editor.toPlainText()))
+    check("被双击的图元处于选中态", item.isSelected())
+    area = view.mapFromScene(item.mapRectToScene(item.rect())).boundingRect()
+    check("编辑器盖在 ROI 上", view._text_editor.geometry().contains(area.center()),
+          f"{view._text_editor.geometry()} vs {area}")
+
+    view._text_editor.setPlainText("手改后的文本")
+    QTest.keyClick(view._text_editor, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
+    check("Ctrl+Enter 采纳并收起编辑器", not view.is_editing_text())
+    check("文本写回图元", view.rois()[0].text == "手改后的文本", str(view.rois()))
+    check("改完立刻写进边车文件", RoiStore().get(paths[0])[0].text == "手改后的文本",
+          str(RoiStore().get(paths[0])))
+    check("结果面板跟着更新", window._panel.item(0, 2).text() == "手改后的文本",
+          window._panel.item(0, 2).text())
+    check("状态栏统计已识别数", "已识别 1" in window._label_roi.text(),
+          window._label_roi.text())
+
+    # ---- Esc 放弃
+    _double_click(viewport, center_of(0))
+    check("再次双击可以继续编辑", view.is_editing_text())
+    view._text_editor.setPlainText("不该保存的文本")
+    QTest.keyClick(view._text_editor, Qt.Key.Key_Escape)
+    check("Esc 放弃并收起编辑器", not view.is_editing_text())
+    check("放弃后图元文本不变", view.rois()[0].text == "手改后的文本", str(view.rois()))
+    check("放弃后文件也没被改", RoiStore().get(paths[0])[0].text == "手改后的文本",
+          str(RoiStore().get(paths[0])))
+
+    # ---- 没识别过的标注也能编辑（编辑器从空串开始）
+    _double_click(viewport, center_of(1))
+    check("空文本的标注也能打开编辑器", view.is_editing_text())
+    check("空文本的编辑器是空的", view._text_editor.toPlainText() == "",
+          repr(view._text_editor.toPlainText()))
+    QTest.keyClick(view._text_editor, Qt.Key.Key_Escape)
+
+    # ---- Ctrl+S 会把正在编辑的文本一起收下去
+    _double_click(viewport, center_of(1))
+    view._text_editor.setPlainText("保存键收下的文本")
+    window.act_save_rois.trigger()
+    check("Ctrl+S 会先收下正在编辑的文本",
+          RoiStore().get(paths[0])[1].text == "保存键收下的文本",
+          str(RoiStore().get(paths[0])))
+    check("Ctrl+S 后编辑器已收起", not view.is_editing_text())
+
+    # ---- 编辑到一半切图：先收下正在敲的字
+    _double_click(viewport, center_of(0))
+    view._text_editor.setPlainText("切图前敲的字")
+    window.show_next()
+    check("切图会先收下正在编辑的文本", RoiStore().get(paths[0])[0].text == "切图前敲的字",
+          str(RoiStore().get(paths[0])))
+    check("切图后编辑器已收起", not view.is_editing_text())
+    window.show_prev()
+    check("切回来能看到改后的文本", view.rois()[0].text == "切图前敲的字",
+          str(view.rois()))
+
+    # ---- 双击空白处不打开编辑器
+    empty = view.mapFromScene(view.image_rect().topLeft() + QPointF(3, 3))
+    _double_click(viewport, empty)
+    check("双击空白处不打开编辑器", not view.is_editing_text())
+
+    # ---- 结果面板：识别文本列可编辑，改完同样写回图元并落盘
+    cell = window._panel.item(0, 2)
+    check("识别文本单元格可编辑", bool(cell.flags() & Qt.ItemFlag.ItemIsEditable))
+    check("面板只在双击时进入编辑",
+          bool(window._panel.editTriggers() & QAbstractItemView.EditTrigger.DoubleClicked))
+    check("位置列仍然只读",
+          not (window._panel.item(0, 1).flags() & Qt.ItemFlag.ItemIsEditable))
+    window._panel.editItem(cell)  # 与双击该单元格走同一条路
+    QApplication.processEvents()
+    editor = window._panel.findChild(QLineEdit)
+    check("面板编辑器带出原文本", editor is not None and editor.text() == "切图前敲的字",
+          repr(editor.text()) if editor is not None else "没有打开编辑器")
+    if editor is None:
+        return
+    editor.setText("面板改的文本")
+    QTest.keyClick(editor, Qt.Key.Key_Return)  # 回车提交，等价于点开别处
+    QApplication.processEvents()
+    check("面板改文本会写回图元", view.rois()[0].text == "面板改的文本", str(view.rois()))
+    check("面板改文本会立刻落盘", RoiStore().get(paths[0])[0].text == "面板改的文本",
+          str(RoiStore().get(paths[0])))
+
+    # ---- 面板正在编辑时收到重填（OCR 收尾、切图都会走这里）不能崩
+    window._panel.editItem(window._panel.item(0, 2))
+    window._refresh_ocr_panel()
+    QApplication.processEvents()
+    check("面板编辑中重填不崩溃", window._panel.rowCount() == view.roi_count(),
+          f"{window._panel.rowCount()} vs {view.roi_count()}")
+
+    view.clear_rois()  # 别把标注留给后面的 OCR 测试
+
+
 def _fake_manga_ocr_run(image: QImage) -> tuple[str, dict]:
     """用假的 ``manga_ocr`` 模块走一遍 :class:`MangaOcrEngine`，验证接线。
 
@@ -782,6 +911,7 @@ def main() -> int:
         test_broken_image(window, root)
         test_roi_interaction(window, root)
         test_hand_mode(window, root)
+        test_text_edit(window, root)
         test_ocr_workflow(window, root, engine)
         test_ocr_cancel(window, root, engine)
         test_ocr_merge(window, root)

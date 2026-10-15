@@ -1,16 +1,22 @@
 """无界面冒烟测试：不需要 pytest，直接 ``uv run python tests/smoke_test.py``。
 
 覆盖：文件夹扫描与自然排序、打开/切换图像、缩放范围、快捷键绑定、ROI 框选与
-标注存取，以及坏图不让程序崩溃。
+标注存取、OCR（裁剪 / 引擎接线 / 后台任务 / 结果落盘）以及坏图不让程序崩溃。
+
+OCR 部分注入一个假引擎（``MainWindow(ocr_factory=...)``），所以这里不会加载 torch，
+也不会去 HuggingFace 下载模型——真正跑 manga-ocr 的手动验证见 README。
 
 在无显示器的环境下会自动使用 offscreen 平台插件。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
+import time
+import types
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -30,8 +36,37 @@ from ocr_proofread.annotations import (  # noqa: E402
 from ocr_proofread.app import MainWindow  # noqa: E402
 from ocr_proofread.image_view import MAX_SCALE, MIN_SCALE  # noqa: E402
 from ocr_proofread.images import collect_images, load_qimage, natural_key  # noqa: E402
+from ocr_proofread.ocr import (  # noqa: E402
+    MANGA_OCR,
+    OCR_MODELS,
+    MangaOcrEngine,
+    OcrError,
+    create_engine,
+    crop_roi,
+    is_known_model,
+    model_label,
+)
 
 FAILURES: list[str] = []
+
+
+class FakeOcrEngine:
+    """假引擎：验证"裁剪 → 子线程 → 写回图元 → 落盘"整条链路，不碰 torch。
+
+    ``delay`` 用来把识别拖慢，好测"识别到一半切图"的取消路径。
+    """
+
+    name = "fake"
+
+    def __init__(self, *, delay: float = 0.0) -> None:
+        self.delay = delay
+        self.sizes: list[tuple[int, int]] = []
+
+    def recognize(self, image: QImage) -> str:
+        if self.delay:
+            time.sleep(self.delay)
+        self.sizes.append((image.width(), image.height()))
+        return f"识别结果-{len(self.sizes)}"
 
 
 def check(label: str, condition: bool, detail: str = "") -> None:
@@ -199,7 +234,7 @@ def drag(widget, start: QPoint, end: QPoint, *, steps: int = 4) -> None:
 
 
 def same_rois(left, right, tolerance: float = 0.02) -> bool:
-    """两组标注是否一致（允许存盘时四舍五入带来的误差）。"""
+    """两组标注是否一致（几何允许存盘四舍五入的误差，识别文本要求完全相同）。"""
     if len(left) != len(right):
         return False
     return all(
@@ -207,6 +242,7 @@ def same_rois(left, right, tolerance: float = 0.02) -> bool:
         and abs(a.y - b.y) <= tolerance
         and abs(a.width - b.width) <= tolerance
         and abs(a.height - b.height) <= tolerance
+        and a.text == b.text
         for a, b in zip(left, right)
     )
 
@@ -222,7 +258,9 @@ def inside(roi: Roi, bounds: QRectF, tolerance: float = 0.05) -> bool:
 
 
 def test_roi_store(root: Path) -> None:
-    path = root / "img2.png"
+    # 用一个不会出现在浏览列表里的路径：这里的边车文件是给存储层测的，
+    # 别把标注留给后面的"切图/适应窗口"测试。
+    path = root / "sub" / "store_target.png"
     check("没标过的图读出来是空的", RoiStore().get(path) == [])
 
     store = RoiStore()
@@ -231,7 +269,8 @@ def test_roi_store(root: Path) -> None:
     check("边车文件落在图像旁边", sidecar_path(path).is_file(), str(sidecar_path(path)))
     check("内容没变时不再写盘", store.set(path, rois) is False)
     check("新的 store 能读回同样内容", same_rois(RoiStore().get(path), rois))
-    check("边车文件不会被当成图像", sidecar_path(path) not in collect_images(root))
+    check("边车文件不会被当成图像",
+          sidecar_path(path) not in collect_images(root, recursive=True))
 
     sidecar_path(path).write_text("{ 这不是 JSON", encoding="utf-8")
     check("损坏的标注文件按空处理", RoiStore().get(path) == [])
@@ -245,6 +284,24 @@ def test_roi_store(root: Path) -> None:
     store.set(path, [Roi(0, 0, 10, 10)])
     store.set(path, [])
     check("清空标注会删掉边车文件", not sidecar_path(path).exists())
+
+    recognized = [Roi(1, 2, 30, 40, "認識された"), Roi(50, 60, 70, 80)]
+    store = RoiStore()
+    store.set(path, recognized)
+    check("识别文本随标注一起读回", same_rois(RoiStore().get(path), recognized),
+          str(RoiStore().get(path)))
+    raw = json.loads(sidecar_path(path).read_text(encoding="utf-8"))
+    check("识别过的标注写了 text 字段", raw["annotations"][0].get("text") == "認識された",
+          json.dumps(raw, ensure_ascii=False))
+    check("没识别过的标注不写 text 字段", "text" not in raw["annotations"][1],
+          json.dumps(raw["annotations"][1], ensure_ascii=False))
+    check("边车文件版本升到 2", raw["version"] == 2, str(raw["version"]))
+
+    legacy = sidecar_path(path)
+    legacy.write_text('{"version": 1, "annotations": [{"x": 1, "y": 2, "w": 3, "h": 4}]}',
+                      encoding="utf-8")
+    check("v1 老文件照常读入（text 为空串）", RoiStore().get(path) == [Roi(1, 2, 3, 4, "")],
+          str(RoiStore().get(path)))
 
 
 def test_roi_interaction(window: MainWindow, root: Path) -> None:
@@ -386,17 +443,205 @@ def test_roi_interaction(window: MainWindow, root: Path) -> None:
     check("重新切回仍是空的", view.roi_count() == 0)
 
 
+def _fake_manga_ocr_run(image: QImage) -> tuple[str, dict]:
+    """用假的 ``manga_ocr`` 模块走一遍 :class:`MangaOcrEngine`，验证接线。
+
+    这样不用装 torch、也不用下载模型，就能确认"QImage 图块 → PIL 图像 → 文本"这条路径。
+    """
+    seen: dict = {}
+
+    class FakeMangaOcr:
+        def __init__(self, **kwargs) -> None:
+            seen["kwargs"] = kwargs
+
+        def __call__(self, img) -> str:
+            seen["size"] = img.size
+            seen["mode"] = img.mode
+            return "  認識された テキスト \n"
+
+    module = types.ModuleType("manga_ocr")
+    module.MangaOcr = FakeMangaOcr
+    saved = sys.modules.get("manga_ocr")
+    sys.modules["manga_ocr"] = module
+    try:
+        text = MangaOcrEngine().recognize(image)
+    finally:
+        if saved is None:
+            sys.modules.pop("manga_ocr", None)
+        else:
+            sys.modules["manga_ocr"] = saved
+    return text, seen
+
+
+def test_ocr_engine() -> None:
+    image = QImage(200, 100, QImage.Format.Format_RGB32)
+    image.fill(QColor("#ffffff"))
+
+    crop = crop_roi(image, Roi(10.4, 20.6, 30.2, 40.1))
+    check("按 ROI 裁剪：边界向外取整", (crop.width(), crop.height()) == (31, 41),
+          f"{crop.width()}×{crop.height()}")
+    check("裁剪不会超出原图", crop.width() <= image.width() and crop.height() <= image.height())
+
+    outside = crop_roi(image, Roi(190, 90, 50, 50))
+    check("ROI 超出图像时裁剪被夹住", (outside.width(), outside.height()) == (10, 10),
+          f"{outside.width()}×{outside.height()}")
+    try:
+        crop_roi(image, Roi(500, 500, 10, 10))
+    except OcrError:
+        check("ROI 完全在图像外时报错", True)
+    else:
+        check("ROI 完全在图像外时报错", False, "没有抛 OcrError")
+
+    check("模型清单里有 manga-ocr", is_known_model(MANGA_OCR) and MANGA_OCR in
+          [model.name for model in OCR_MODELS], str([model.name for model in OCR_MODELS]))
+    check("模型有给菜单用的名字", model_label(MANGA_OCR) != MANGA_OCR, model_label(MANGA_OCR))
+    try:
+        create_engine("不存在的模型")
+    except OcrError:
+        check("未知模型名会报错", True)
+    else:
+        check("未知模型名会报错", False, "没有抛 OcrError")
+
+    text, seen = _fake_manga_ocr_run(QImage(60, 30, QImage.Format.Format_RGB32))
+    check("manga-ocr 接线：图块按 PIL 图像传入", seen.get("size") == (60, 30), str(seen))
+    check("manga-ocr 接线：识别文本去掉首尾空白", text == "認識された テキスト", repr(text))
+
+
+def wait_for_ocr(window: MainWindow, timeout_ms: int = 20000) -> bool:
+    """等后台识别任务收尾；返回是否真的等到了。
+
+    ``qWait`` 之后必须让出一下 GIL：紧循环里 ``qWait`` 会长时间占着 GIL，把识别线程
+    饿死（真模型加载一下就看得出来），加个 ``sleep`` 才是"等它跑完"而不是"跟它抢"。
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while window._ocr_job is not None and time.monotonic() < deadline:
+        QTest.qWait(10)
+        time.sleep(0.01)
+    return window._ocr_job is None
+
+
+def test_ocr_workflow(window: MainWindow, root: Path, engine: FakeOcrEngine) -> None:
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    window.view.set_rois([Roi(10, 10, 40, 20), Roi(60, 30, 30, 30), Roi(120, 40, 50, 25)])
+    check("OCR 准备：三个标注", window.view.roi_count() == 3, str(window.view.roi_count()))
+    check("结果面板行数跟随标注", window._panel.rowCount() == 3, str(window._panel.rowCount()))
+    check("有标注时「识别全部」可用", window.act_ocr_all.isEnabled())
+    check("没选中任何标注时「识别选中」不可用", not window.act_ocr_selected.isEnabled())
+
+    # ---- 只识别选中的那一个
+    window.view.roi_items()[1].setSelected(True)
+    check("选中标注后「识别选中」可用", window.act_ocr_selected.isEnabled())
+    before = len(engine.sizes)
+    window.act_ocr_selected.trigger()
+    check("识别期间 OCR 动作禁用",
+          not window.act_ocr_selected.isEnabled() and not window.act_ocr_all.isEnabled())
+    check("识别任务能跑完", wait_for_ocr(window))
+    check("只把选中的那个送去识别", engine.sizes[before:] == [(30, 30)],
+          str(engine.sizes[before:]))
+
+    texts = [roi.text for roi in window.view.rois()]
+    check("结果只挂到被识别的 ROI 上", [bool(t) for t in texts] == [False, True, False],
+          str(texts))
+    check("状态栏报告识别结果", "已识别 1 个标注" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+
+    window.act_save_rois.trigger()
+    raw = json.loads(sidecar_path(paths[0]).read_text(encoding="utf-8"))
+    check("识别文本写进边车文件", raw["annotations"][1].get("text") == texts[1],
+          json.dumps(raw, ensure_ascii=False))
+    check("没识别的标注仍不写 text 字段", "text" not in raw["annotations"][0],
+          json.dumps(raw["annotations"][0], ensure_ascii=False))
+    check("边车文件版本为 2", raw["version"] == 2, str(raw["version"]))
+
+    # ---- 识别全部
+    window.act_ocr_all.trigger()
+    check("识别全部也能跑完", wait_for_ocr(window))
+    all_texts = [roi.text for roi in window.view.rois()]
+    check("全部识别：三个都有文本", all(all_texts), str(all_texts))
+    check("重识别会覆盖旧结果", all_texts[1] != texts[1], f"{texts[1]} -> {all_texts[1]}")
+    check("结果面板同步显示文本", window._panel.item(0, 2).text() == all_texts[0],
+          window._panel.item(0, 2).text())
+
+    # 切图会清空场景（连选中的图元一起删掉），结果面板此时不能去碰已经作废的引用
+    window.view.roi_items()[0].setSelected(True)
+    window.show_next()
+    window.show_prev()
+    check("切走再切回，识别结果跟着标注回来",
+          [roi.text for roi in window.view.rois()] == all_texts,
+          str([roi.text for roi in window.view.rois()]))
+
+    item = window.view.roi_items()[0]
+    item.setPos(item.pos() + QPointF(5, 5))
+    check("移动标注不丢识别结果", window.view.rois()[0].text == all_texts[0],
+          window.view.rois()[0].text)
+
+    window._panel.clearSelection()
+    window._panel.selectRow(2)
+    QApplication.processEvents()
+    check("点结果面板的行会选中对应的框", window.view.roi_items()[2].isSelected())
+
+    window.view.roi_items()[2].setSelected(True)
+    window.act_delete_roi.trigger()
+    window.show_next()
+    check("删除标注后文件里也不再有它的文本", len(RoiStore().get(paths[0])) == 2,
+          str(RoiStore().get(paths[0])))
+
+
+def test_ocr_cancel(window: MainWindow, root: Path, engine: FakeOcrEngine) -> None:
+    """识别到一半切图：要能停下来，而且已经识别出来的部分不能丢。"""
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.view.set_rois([Roi(10, 10, 40, 20), Roi(60, 30, 30, 30), Roi(120, 40, 50, 25)])
+    window.act_save_rois.trigger()
+
+    engine.delay = 0.05  # 让每个图块慢一点，好在识别中途切图
+    window.act_ocr_all.trigger()
+    check("识别任务已经起来", window._ocr_job is not None)
+    window.show_next()
+    engine.delay = 0.0
+
+    check("切图会取消识别并收尾", window._ocr_job is None)
+    check("切图后停在新的一张", window._index == 1, str(window._index))
+    stored = RoiStore().get(paths[0])
+    check("取消后标注一个不少", len(stored) == 3, str(stored))
+    check("取消最多只保留已经识别完的那一个", sum(1 for r in stored if r.text) <= 1,
+          str([r.text for r in stored]))
+
+
+def test_ocr_merge(window: MainWindow, root: Path) -> None:
+    """兜底路径：结果迟到、图已切走时按几何并回文件。"""
+    path = root / "sub" / "deep.png"
+    window._roi_store.set(path, [Roi(10, 20, 30, 40)])
+    merged = window._merge_ocr_text(path, [(Roi(10, 20, 30, 40), "兜底文本")])
+    check("迟到结果按位置并回文件", merged == 1, str(merged))
+    check("兜底文本真的落了盘", RoiStore().get(path)[0].text == "兜底文本",
+          str(RoiStore().get(path)))
+
+    merged = window._merge_ocr_text(path, [(Roi(99, 99, 9, 9), "对不上的结果")])
+    check("位置对不上的结果不写", merged == 0, str(merged))
+    check("原有文本没被改掉", RoiStore().get(path)[0].text == "兜底文本")
+
+
 def _shortcut_texts(action) -> list[str]:
     return [seq.toString() for seq in action.shortcuts()]
 
 
 def fits_in_viewport(window: MainWindow, tolerance: int = 3) -> bool:
-    """图像当前映射到视口里的矩形是否完整落在视口内。"""
+    """图像当前映射到视口里的矩形是否完整落在视口内。
+
+    只量图像本身，不用 ``itemsBoundingRect()``：ROI 的缩放手柄是挂在矩形外的子图元，
+    会把包围盒撑大，量出来就不是"整张图可见"了。
+    """
     view = window.view
-    item_rect = view.scene().itemsBoundingRect()
-    if item_rect.isEmpty():
+    image_rect = view.image_rect()
+    if image_rect.isEmpty():
         return False
-    shown = view.mapFromScene(item_rect).boundingRect()
+    shown = view.mapFromScene(image_rect).boundingRect()
     viewport = view.viewport().rect().adjusted(-tolerance, -tolerance, tolerance, tolerance)
     return viewport.contains(shown)
 
@@ -440,15 +685,20 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="ocr-proofread-smoke-") as tmp:
         root = Path(tmp)
         build_fixture(root)
+        engine = FakeOcrEngine()
 
         test_collect(root)
         test_roi_store(root)
+        test_ocr_engine()
 
-        window = MainWindow()
+        window = MainWindow(ocr_factory=lambda name: engine)
         test_navigation(window, root)
         test_zoom(window)
         test_broken_image(window, root)
         test_roi_interaction(window, root)
+        test_ocr_workflow(window, root, engine)
+        test_ocr_cancel(window, root, engine)
+        test_ocr_merge(window, root)
         window.close()
 
     print()

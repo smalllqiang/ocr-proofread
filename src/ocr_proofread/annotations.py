@@ -1,7 +1,7 @@
 """ROI 标注的数据结构与持久化。
 
-这一层不依赖任何界面控件：``Roi`` 只是四个浮点数，``RoiStore`` 负责内存缓存与
-JSON 边车文件读写。存储按"一张图一份"组织，文件放在图像旁边，命名为
+这一层不依赖任何界面控件：``Roi`` 是四个浮点数加一段可选的识别文本，``RoiStore``
+负责内存缓存与 JSON 边车文件读写。存储按"一张图一份"组织，文件放在图像旁边，命名为
 ``<图像文件名>.roi.json``（``page1.png`` 对应 ``page1.png.roi.json``），
 这样复制或移动图像文件夹时标注跟着走，不同文件夹里的同名图也不会互相覆盖。
 
@@ -21,18 +21,25 @@ from PySide6.QtCore import QRectF
 #: 边车文件名后缀，拼在完整图像文件名之后
 SIDECAR_SUFFIX = ".roi.json"
 
-#: 标注文件格式版本，便于以后升级
-FORMAT_VERSION = 1
+#: 标注文件格式版本，便于以后升级。
+#: v1 只有几何；v2 起每条记录可以带可选的 ``text``（OCR 识别结果）。读盘不校验版本，
+#: 缺少 ``text`` 的 v1 文件照常读入。
+FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
 class Roi:
-    """一个矩形标注，单位是图像像素，原点在图像左上角。"""
+    """一个矩形标注，单位是图像像素，原点在图像左上角。
+
+    ``text`` 是这个区域最近一次的 OCR 结果，空串表示还没识别过。文本不参与几何运算，
+    只跟着标注一起存取；等于说"识别结果挂在 ROI 上"。
+    """
 
     x: float
     y: float
     width: float
     height: float
+    text: str = ""
 
     def __post_init__(self) -> None:
         if self.width < 0 or self.height < 0:
@@ -42,19 +49,29 @@ class Roi:
         """转成 Qt 矩形（仍是图像像素坐标）。"""
         return QRectF(self.x, self.y, self.width, self.height)
 
+    def with_text(self, text: str) -> Roi:
+        """返回一个只换了识别文本的副本（:class:`Roi` 本身不可变）。"""
+        return Roi(self.x, self.y, self.width, self.height, text)
+
     @classmethod
-    def from_rect(cls, rect: QRectF) -> Roi:
+    def from_rect(cls, rect: QRectF, text: str = "") -> Roi:
         """从 Qt 矩形构造，负宽高会被规整。"""
         normalized = QRectF(rect).normalized()
-        return cls(normalized.x(), normalized.y(), normalized.width(), normalized.height())
+        return cls(
+            normalized.x(), normalized.y(), normalized.width(), normalized.height(), text
+        )
 
-    def to_dict(self) -> dict[str, float]:
-        return {
+    def to_dict(self) -> dict[str, float | str]:
+        """转成写盘用的字典；没识别过的标注不写 ``text`` 字段。"""
+        data: dict[str, float | str] = {
             "x": round(self.x, 2),
             "y": round(self.y, 2),
             "w": round(self.width, 2),
             "h": round(self.height, 2),
         }
+        if self.text:
+            data["text"] = self.text
+        return data
 
     @classmethod
     def from_dict(cls, data: object) -> Roi | None:
@@ -70,7 +87,10 @@ class Roi:
             )
         except (KeyError, TypeError, ValueError):
             return None
-        return roi if roi.width > 0 and roi.height > 0 else None
+        if roi.width <= 0 or roi.height <= 0:
+            return None
+        text = data.get("text", "")
+        return roi.with_text(text) if isinstance(text, str) else roi
 
 
 def sidecar_path(image_path: str | Path) -> Path:
@@ -167,7 +187,7 @@ class RoiStore:
             self._rois[key] = load_rois(key)
             self._loaded.add(key)
 
-        new = [Roi(r.x, r.y, r.width, r.height) for r in rois]
+        new = [Roi(r.x, r.y, r.width, r.height, r.text) for r in rois]
         if new == self._rois[key]:
             return False
         self._rois[key] = new

@@ -47,10 +47,14 @@ class ImageView(QGraphicsView):
     #: 场景里的 ROI 数量发生变化（新增、删除、整批替换）时发出；移动与缩放不发
     roisChanged = Signal()
 
+    #: 场景里的选中状态变化（选中 / 取消选中 / 改选另一个）时发出
+    selectionChanged = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
         self.setScene(self._scene)
+        self._scene.selectionChanged.connect(self.selectionChanged)
 
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -63,6 +67,7 @@ class ImageView(QGraphicsView):
         self.setMouseTracking(True)
 
         self._item: QGraphicsPixmapItem | None = None
+        self._image: QImage | None = None
         self._scale = 1.0
         self._auto_fit = True  # 窗口大小变化时是否自动重新适应窗口
         self._panning = False
@@ -80,6 +85,14 @@ class ImageView(QGraphicsView):
     def scale_factor(self) -> float:
         return self._scale
 
+    def image(self) -> QImage | None:
+        """当前显示的图像（图像像素）；没有图像时是 ``None``。
+
+        底图同时以 ``QPixmap`` 挂在场景里，这里保留原 :class:`QImage` 是为了按 ROI
+        裁剪出 OCR 图块。
+        """
+        return self._image
+
     def set_image(self, image: QImage | None) -> None:
         """替换当前显示的图像；传入 ``None`` 表示清空。
 
@@ -88,6 +101,7 @@ class ImageView(QGraphicsView):
         """
         self._scene.clear()
         self._item = None
+        self._image = None
         self._scale = 1.0
         self._panning = False
         self._drawing = None
@@ -103,6 +117,7 @@ class ImageView(QGraphicsView):
         self._scene.addItem(item)
         self._scene.setSceneRect(item.boundingRect())
         self._item = item
+        self._image = image
         self.fit_to_window()
 
     # -------------------------------------------------------------------- ROI
@@ -134,7 +149,7 @@ class ImageView(QGraphicsView):
         for item in self.roi_items():
             self._scene.removeItem(item)
         for roi in rois:
-            self._add_roi_item(roi.as_rect())
+            self._add_roi_item(roi.as_rect(), roi.text)
         self.roisChanged.emit()
 
     def clear_rois(self) -> None:
@@ -154,9 +169,19 @@ class ImageView(QGraphicsView):
             self.roisChanged.emit()
         return len(selected)
 
-    def _add_roi_item(self, rect: QRectF) -> RoiItem:
+    def select_roi_item(self, item: RoiItem, *, center: bool = True) -> None:
+        """只选中给定的 ROI 图元（可选把它挪到视口中间）。
+
+        OCR 结果面板点某一行时走这里，场景 → 面板的反向同步走 :attr:`selectionChanged`。
+        """
+        for other in self.roi_items():
+            other.setSelected(other is item)
+        if center:
+            self.centerOn(item)
+
+    def _add_roi_item(self, rect: QRectF, text: str = "") -> RoiItem:
         bounds = self.image_rect()
-        item = RoiItem(rect, bounds=bounds if not bounds.isEmpty() else None)
+        item = RoiItem(rect, bounds=bounds if not bounds.isEmpty() else None, text=text)
         self._scene.addItem(item)
         return item
 

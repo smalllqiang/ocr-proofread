@@ -133,6 +133,9 @@ class RoiItem(QGraphicsRectItem):
 
     ``bounds`` 是允许的范围（一般是图像矩形，图像像素坐标）；给定时，整体拖动与
     手柄缩放都被夹在范围内，图元不会被拖到图像外面。
+
+    图元还挂着一份 OCR 文本（:meth:`text` / :meth:`set_text`），随 :meth:`to_roi`
+    一起交给上层落盘；它不参与几何运算，只是"识别结果跟着这个框走"。
     """
 
     def __init__(
@@ -140,11 +143,13 @@ class RoiItem(QGraphicsRectItem):
         rect: QRectF,
         *,
         bounds: QRectF | None = None,
+        text: str = "",
         parent: QGraphicsItem | None = None,
     ) -> None:
         super().__init__(QRectF(rect).normalized(), parent)
         self._bounds = QRectF(bounds) if bounds is not None else None
         self._hovered = False
+        self._text = text
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -152,7 +157,7 @@ class RoiItem(QGraphicsRectItem):
         self.setAcceptHoverEvents(True)
         self.setZValue(1.0)
         self.setBrush(QBrush(_FILL_COLOR))
-        self.setToolTip("拖动移动，拖动方块手柄缩放，Delete 删除")
+        self._apply_tooltip()
         self._apply_pen()
 
         self._handles = [RoiHandle(self, role) for role in HandleRole]
@@ -162,8 +167,17 @@ class RoiItem(QGraphicsRectItem):
     # ------------------------------------------------------------------ 数据
 
     def to_roi(self) -> Roi:
-        """当前几何（含 ``pos`` 偏移）转成图像坐标的 :class:`Roi`。"""
-        return Roi.from_rect(self.mapRectToScene(self.rect()))
+        """当前几何（含 ``pos`` 偏移）与 OCR 文本转成图像坐标的 :class:`Roi`。"""
+        return Roi.from_rect(self.mapRectToScene(self.rect()), self._text)
+
+    def text(self) -> str:
+        """这个 ROI 最近一次的 OCR 结果；空串表示还没识别过。"""
+        return self._text
+
+    def set_text(self, text: str) -> None:
+        """写入 OCR 结果（同时刷新提示气泡）。"""
+        self._text = text
+        self._apply_tooltip()
 
     # ------------------------------------------------------------------ 交互
 
@@ -226,6 +240,10 @@ class RoiItem(QGraphicsRectItem):
         for handle in self._handles:
             fx, fy = handle.role.factors
             handle.setPos(rect.left() + fx * rect.width(), rect.top() + fy * rect.height())
+
+    def _apply_tooltip(self) -> None:
+        hint = "拖动移动，拖动方块手柄缩放，Delete 删除"
+        self.setToolTip(f"{self._text}\n\n{hint}" if self._text else hint)
 
     def _apply_pen(self) -> None:
         if self.isSelected():

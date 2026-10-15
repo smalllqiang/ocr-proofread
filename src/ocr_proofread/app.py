@@ -1,36 +1,117 @@
-"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、ROI 标注、状态持久化。
+"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、ROI 标注、OCR、状态持久化。
 
 ROI 图元的挂载点与生命周期约定见 :mod:`ocr_proofread.image_view`；
-"每张图一份标注"的存取见 :mod:`ocr_proofread.annotations`。
+"每张图一份标注"的存取见 :mod:`ocr_proofread.annotations`；
+OCR 引擎与后台识别任务见 :mod:`ocr_proofread.ocr`。
 
 跨图状态的唯一持有者是这里：视图只持有当前这一张图，切图时本模块负责把
 上一张的标注落盘、把下一张的标注装回场景（见 :meth:`MainWindow._show`）。
+识别任务也在这里收口：结果先在子线程算出来，再写回图元并随标注一起落盘。
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
-from PySide6.QtCore import QSettings, QSize, Qt
+from PySide6.QtCore import QObject, QSettings, QSize, Qt, QThread
 from PySide6.QtGui import QAction, QCloseEvent, QGuiApplication, QImage, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QDockWidget,
     QFileDialog,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QTableWidget,
+    QTableWidgetItem,
 )
 
 from .annotations import RoiStore
 from .image_view import ImageView
 from .images import IMAGE_NAME_FILTER, collect_images, is_image_file, load_qimage
+from .ocr import (
+    DEFAULT_MODEL,
+    OCR_MODELS,
+    OcrEngine,
+    OcrError,
+    OcrTask,
+    create_engine,
+    crop_roi,
+    is_known_model,
+    model_label,
+)
+
+if TYPE_CHECKING:  # 只用于类型标注，避免运行时多一层依赖
+    from .annotations import Roi
+    from .roi_item import RoiItem
 
 APP_NAME = "OCR 校对工具"
 
+#: 判断两个矩形是不是同一处（OCR 结果兜底合并时用，允许浮点误差）
+_RECT_TOLERANCE = 0.5
+
+
+class _OcrJob(QObject):
+    """一次识别任务的现场，同时是跨线程信号的落点。
+
+    ``OcrTask`` 在子线程里发信号，而下面这些槽属于住在界面线程的 ``_OcrJob``，
+    Qt 因此会把它们排队回界面线程执行——界面状态自始至终只有界面线程在改。
+    （直接把信号接到 lambda 上是不行的：没有 QObject 接收者，槽会在发信号的
+    子线程里跑。）
+    """
+
+    def __init__(
+        self,
+        window: MainWindow,
+        path: Path,
+        model: str,
+        items: list[RoiItem],
+        rois: list[Roi],
+        task: OcrTask,
+        thread: QThread,
+    ) -> None:
+        super().__init__(window)  # 父对象在界面线程，本对象也归属界面线程
+        self.window = window
+        self.path = path
+        self.model = model
+        self.items = items
+        self.rois = rois
+        self.task = task
+        self.thread = thread
+        task.progressed.connect(self._relay_progress)
+        task.finished.connect(self._relay_finished)
+        task.finished.connect(thread.quit)
+
+    def _relay_progress(self, done: int, total: int) -> None:
+        self.window._on_ocr_progressed(self, done, total)
+
+    def _relay_finished(self, cancelled: bool) -> None:
+        self.window._on_ocr_finished(self, cancelled)
+
+
+def _same_rect(left, right) -> bool:
+    """两个矩形是否基本上是同一处（坐标存盘会四舍五入到 2 位小数）。"""
+    return (
+        abs(left.x() - right.x()) <= _RECT_TOLERANCE
+        and abs(left.y() - right.y()) <= _RECT_TOLERANCE
+        and abs(left.width() - right.width()) <= _RECT_TOLERANCE
+        and abs(left.height() - right.height()) <= _RECT_TOLERANCE
+    )
+
+
+def _table_cell(text: str) -> QTableWidgetItem:
+    """OCR 结果面板里的只读单元格。"""
+    cell = QTableWidgetItem(text)
+    cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+    return cell
+
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, ocr_factory: Callable[[str], OcrEngine] | None = None) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(1280, 860)
@@ -41,6 +122,13 @@ class MainWindow(QMainWindow):
         self._image_size = QSize()
         self._settings = QSettings("ocr-proofread", "ocr-proofread")
         self._roi_store = RoiStore()
+
+        # OCR：引擎按模型名字缓存，模型很重，不能每识别一次就加载一遍
+        self._ocr_factory = ocr_factory or create_engine
+        self._ocr_engines: dict[str, OcrEngine] = {}
+        self._ocr_model = self._restore_ocr_model()
+        self._ocr_job: _OcrJob | None = None
+        self._panel_items: list[RoiItem] = []
 
         self.view = ImageView(self)
         self.view.zoomChanged.connect(self._on_zoom_changed)
@@ -56,6 +144,7 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self._label_zoom)
 
         self._create_actions()
+        self._create_ocr_panel()
         self._create_menus()
         self._create_toolbar()
         self._restore_settings()
@@ -161,6 +250,54 @@ class MainWindow(QMainWindow):
             tip="把当前图像的标注写入图像旁边的 .roi.json 文件",
         )
 
+        self.act_ocr_selected = self._make_action(
+            "识别选中标注(&S)",
+            shortcuts=["Ctrl+R"],
+            slot=self._ocr_selected,
+            tip="用当前 OCR 模型识别选中的矩形标注",
+        )
+        self.act_ocr_all = self._make_action(
+            "识别全部标注(&A)",
+            shortcuts=["Ctrl+Shift+R"],
+            slot=self._ocr_all,
+            tip="用当前 OCR 模型识别当前图像上的全部标注",
+        )
+
+    def _create_ocr_panel(self) -> None:
+        """右侧的 OCR 结果面板：一行一个 ROI，点行选中对应的框。"""
+        self._panel = QTableWidget(0, 3, self)
+        self._panel.setHorizontalHeaderLabels(["#", "位置 / 尺寸", "识别文本"])
+        self._panel.verticalHeader().setVisible(False)
+        self._panel.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._panel.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._panel.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._panel.setWordWrap(True)  # 识别文本宁可换行也不要被省略号截掉
+        header = self._panel.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._panel.itemSelectionChanged.connect(self._on_panel_selection_changed)
+
+        dock = QDockWidget("OCR 结果", self)
+        dock.setObjectName("ocr_panel")
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        dock.setWidget(self._panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.resizeDocks([dock], [380], Qt.Orientation.Horizontal)  # 给识别文本留出宽度
+        self._ocr_dock = dock
+
+        # 交给 Qt 的 toggleViewAction，菜单勾选状态与浮动/关闭按钮自动同步
+        self.act_toggle_ocr_panel = dock.toggleViewAction()
+        self.act_toggle_ocr_panel.setText("识别结果面板(&R)")
+        self.act_toggle_ocr_panel.setStatusTip("显示或隐藏右侧的 OCR 结果列表")
+
+        self.view.roisChanged.connect(self._refresh_ocr_panel)
+        self.view.roisChanged.connect(self._update_actions)
+        self.view.selectionChanged.connect(self._sync_panel_selection)
+        self.view.selectionChanged.connect(self._update_actions)
+
     def _create_menus(self) -> None:
         bar = self.menuBar()
 
@@ -192,6 +329,25 @@ class MainWindow(QMainWindow):
         menu_roi.addSeparator()
         menu_roi.addAction(self.act_save_rois)
 
+        menu_ocr = bar.addMenu("OCR(&O)")
+        menu_ocr.addAction(self.act_ocr_selected)
+        menu_ocr.addAction(self.act_ocr_all)
+        menu_ocr.addSeparator()
+        menu_model = menu_ocr.addMenu("识别模型(&M)")
+        self._model_actions: dict[str, QAction] = {}
+        for model in OCR_MODELS:
+            action = QAction(model.label, self)
+            action.setCheckable(True)
+            action.setChecked(model.name == self._ocr_model)
+            action.setStatusTip(f"用 {model.label} 识别")
+            action.triggered.connect(
+                lambda _checked=False, name=model.name: self._set_ocr_model(name)
+            )
+            menu_model.addAction(action)
+            self._model_actions[model.name] = action
+        menu_ocr.addSeparator()
+        menu_ocr.addAction(self.act_toggle_ocr_panel)
+
         menu_help = bar.addMenu("帮助(&H)")
         menu_help.addAction(
             self._make_action("快捷键(&K)", slot=self._show_shortcuts, tip="查看快捷键列表")
@@ -210,6 +366,9 @@ class MainWindow(QMainWindow):
         bar.addAction(self.act_zoom_in)
         bar.addAction(self.act_fit)
         bar.addAction(self.act_actual)
+        bar.addSeparator()
+        bar.addAction(self.act_ocr_selected)
+        bar.addAction(self.act_ocr_all)
 
     # ------------------------------------------------------------------ 打开
 
@@ -243,7 +402,8 @@ class MainWindow(QMainWindow):
         paths = [Path(p) for p in paths]
         if not paths:
             return
-        self._flush_rois()  # 先送走上一组里当前这张图的标注
+        self._cancel_ocr()  # 先停下正在跑的识别，并把已出的结果写回
+        self._flush_rois()  # 再送走上一组里当前这张图的标注
         self._paths = paths
         self._index = -1
         self._remember_dir(paths[0].parent)
@@ -266,6 +426,7 @@ class MainWindow(QMainWindow):
     def _show(self, index: int) -> None:
         if not self._paths:
             return
+        self._cancel_ocr()  # 识别到一半就切图：先停下，把已有结果写回上一张
         index = max(0, min(index, len(self._paths) - 1))
         path = self._paths[index]
 
@@ -307,11 +468,13 @@ class MainWindow(QMainWindow):
             self._show(len(self._paths) - 1)
 
     def _close_image(self) -> None:
+        self._cancel_ocr()
         self._flush_rois()
         self._paths = []
         self._index = -1
         self._image_size = QSize()
         self.view.set_image(None)
+        self._refresh_ocr_panel()  # 图元已经随场景一起没了，面板也要清空
         self._update_status()
         self._update_actions()
 
@@ -383,6 +546,252 @@ class MainWindow(QMainWindow):
         self.act_clear_rois.setEnabled(has_image)
         self.act_save_rois.setEnabled(has_image)
 
+        busy = self._ocr_job is not None
+        items = self.view.roi_items() if has_image else []
+        self.act_ocr_all.setEnabled(bool(items) and not busy)
+        self.act_ocr_selected.setEnabled(
+            any(item.isSelected() for item in items) and not busy
+        )
+
+    # -------------------------------------------------------------------- OCR
+
+    def _restore_ocr_model(self) -> str:
+        """从设置里取上次用的模型；设置里的名字已经不认识时退回默认模型。"""
+        stored = self._settings.value("ocr_model", DEFAULT_MODEL, type=str)
+        return stored if is_known_model(stored) else DEFAULT_MODEL
+
+    def _set_ocr_model(self, name: str) -> None:
+        """切换识别模型（记进 QSettings，下次启动继续用）。"""
+        if not is_known_model(name) or name == self._ocr_model:
+            self._sync_ocr_model_actions()
+            return
+        self._ocr_model = name
+        self._settings.setValue("ocr_model", name)
+        self._sync_ocr_model_actions()
+        self.statusBar().showMessage(f"识别模型已切换为 {model_label(name)}", 4000)
+
+    def _sync_ocr_model_actions(self) -> None:
+        for name, action in self._model_actions.items():
+            action.setChecked(name == self._ocr_model)
+
+    def _engine_for(self, model: str) -> OcrEngine:
+        """按模型名字取引擎（带缓存）；引擎很重，整个程序生命周期只加载一次。"""
+        engine = self._ocr_engines.get(model)
+        if engine is None:
+            engine = self._ocr_factory(model)
+            self._ocr_engines[model] = engine
+        return engine
+
+    def _ocr_selected(self) -> None:
+        self._start_ocr(selected_only=True)
+
+    def _ocr_all(self) -> None:
+        self._start_ocr(selected_only=False)
+
+    def _start_ocr(self, *, selected_only: bool) -> None:
+        """对选中的（或全部的）ROI 起一个后台识别任务。"""
+        path = self._current_path()
+        image = self.view.image()
+        if path is None or image is None or self._ocr_job is not None:
+            return
+
+        items = [
+            item
+            for item in self.view.roi_items()
+            if not selected_only or item.isSelected()
+        ]
+        if not items:
+            self.statusBar().showMessage(
+                "没有选中的标注" if selected_only else "当前图没有标注", 4000
+            )
+            return
+
+        # 裁剪在界面线程做（很快），推理才丢给子线程；图块是 QImage 副本，跨线程安全
+        targets: list[RoiItem] = []
+        crops: list[QImage] = []
+        for item in items:
+            roi = item.to_roi()
+            try:
+                crops.append(crop_roi(image, roi))
+            except OcrError as exc:
+                self.statusBar().showMessage(
+                    f"跳过 {(roi.x, roi.y, roi.width, roi.height)}：{exc}", 6000
+                )
+                continue
+            targets.append(item)
+        if not crops:
+            return
+
+        task = OcrTask(self._engine_for(self._ocr_model), crops)
+        thread = QThread(self)
+        task.moveToThread(thread)
+        job = _OcrJob(
+            window=self,
+            path=path,
+            model=self._ocr_model,
+            items=targets,
+            rois=[item.to_roi() for item in targets],
+            task=task,
+            thread=thread,
+        )
+        thread.started.connect(task.run)
+        thread.finished.connect(thread.deleteLater)
+
+        self._ocr_job = job
+        QGuiApplication.setOverrideCursor(Qt.CursorShape.BusyCursor)
+        self.statusBar().showMessage(
+            f"正在识别 {len(crops)} 个标注（{model_label(self._ocr_model)}）…"
+        )
+        self._update_actions()
+        thread.start()
+
+    def _on_ocr_progressed(self, job: _OcrJob, done: int, total: int) -> None:
+        if job is not self._ocr_job:
+            return
+        self.statusBar().showMessage(
+            f"正在识别 {done}/{total}（{model_label(job.model)}）…"
+        )
+
+    def _on_ocr_finished(self, job: _OcrJob, cancelled: bool) -> None:
+        if job is not self._ocr_job:
+            return  # 已经被 _cancel_ocr 收尾过了
+        self._finalize_ocr(job, cancelled=cancelled)
+
+    def _cancel_ocr(self) -> None:
+        """切图 / 关窗 / 重新打开前调用：停掉识别，把已经识别出来的结果落盘。
+
+        当前这一张图块的推理没法中断，所以这里会等它跑完（通常不到一秒），换来的是
+        "不会有结果悄悄丢掉"。
+        """
+        job = self._ocr_job
+        if job is not None:
+            job.task.cancel()
+            self._finalize_ocr(job, cancelled=True)
+
+    def _finalize_ocr(self, job: _OcrJob, *, cancelled: bool) -> None:
+        """收尾：停线程、把结果写回标注并落盘、报告成败。"""
+        self._ocr_job = None
+        job.thread.quit()
+        job.thread.wait(5000)
+        QGuiApplication.restoreOverrideCursor()
+        self._update_actions()
+
+        if self._current_path() == job.path:
+            applied = 0
+            for index, item in enumerate(job.items):
+                text = job.task.results.get(index)
+                if text is None or item.scene() is None:
+                    continue  # 取消前已被删除的图元就跳过
+                item.set_text(text)
+                applied += 1
+            if applied:
+                self._flush_rois()  # 识别结果随标注一起写进边车文件
+            self._refresh_ocr_panel()
+            self._update_roi_label()
+        else:  # 图像已经切走时（正常流程下不会发生）按几何并回磁盘
+            applied = self._merge_ocr_text(
+                job.path,
+                [(job.rois[index], text) for index, text in job.task.results.items()],
+            )
+
+        failed = len(job.task.errors)
+        if applied:
+            message = f"已识别 {applied} 个标注（{model_label(job.model)}），已写入文件"
+            if cancelled:
+                message += "（识别已取消，已完成的部分保留）"
+            if failed:
+                message += f"，{failed} 个失败"
+            self.statusBar().showMessage(message, 8000)
+        elif failed:
+            message = next(iter(job.task.errors.values()))
+            self.statusBar().showMessage(f"识别失败：{message}", 10000)
+            QMessageBox.warning(self, "OCR 失败", message)
+        elif cancelled:
+            self.statusBar().showMessage("已取消识别", 4000)
+        else:
+            self.statusBar().showMessage("没有识别出文本", 4000)
+
+        job.deleteLater()  # 连同 task 里的图块一起放掉，别攒着占内存
+
+    def _merge_ocr_text(self, path: Path, results: list[tuple[Roi, str]]) -> int:
+        """把识别结果按矩形位置并回某张图已落盘的标注，返回并入条数。
+
+        正常路径下结果都由场景里的图元带走（见 :meth:`_finalize_ocr`），这里是
+        "图已经切走、结果才到"的兜底：几何对不上的结果宁可丢掉也不乱写。
+        """
+        rois = self._roi_store.get(path)
+        merged = 0
+        for snapshot, text in results:
+            for position, roi in enumerate(rois):
+                if _same_rect(roi.as_rect(), snapshot.as_rect()):
+                    rois[position] = roi.with_text(text)
+                    merged += 1
+                    break
+        if merged:
+            try:
+                self._roi_store.set(path, rois)
+            except OSError as exc:
+                self.statusBar().showMessage(f"保存 {path.name} 的识别结果失败：{exc}", 8000)
+                return 0
+        return merged
+
+    # ------------------------------------------------------------ OCR 结果面板
+
+    def _refresh_ocr_panel(self) -> None:
+        """把当前图的 ROI 与识别文本重填进面板（顺序与场景里的 ROI 一致）。"""
+        self._panel_items = self.view.roi_items()
+        self._panel.blockSignals(True)  # 重填过程中不要触发"点行选中图元"
+        try:
+            self._panel.setRowCount(len(self._panel_items))
+            for row, item in enumerate(self._panel_items):
+                roi = item.to_roi()
+                self._panel.setItem(row, 0, _table_cell(str(row + 1)))
+                self._panel.setItem(
+                    row,
+                    1,
+                    _table_cell(
+                        f"{roi.x:.0f}, {roi.y:.0f}  {roi.width:.0f}×{roi.height:.0f}"
+                    ),
+                )
+                text = item.text()
+                cell = _table_cell(text or "—")
+                cell.setToolTip(text)
+                self._panel.setItem(row, 2, cell)
+            self._panel.resizeRowsToContents()  # 换行后的行高
+        finally:
+            self._panel.blockSignals(False)
+        self._sync_panel_selection()
+
+    def _sync_panel_selection(self) -> None:
+        """场景里选中了哪个 ROI，面板就高亮哪一行。
+
+        这里现取场景里的图元，而不是用 :attr:`_panel_items`：清空场景时会连带发出
+        ``selectionChanged``，那份缓存的图元已经作废，碰不得。
+        """
+        items = self.view.roi_items()
+        selected = [item for item in items if item.isSelected()]
+        row = items.index(selected[0]) if selected else -1
+        self._panel.blockSignals(True)
+        try:
+            if row < 0:
+                self._panel.clearSelection()
+            else:
+                self._panel.selectRow(row)
+        finally:
+            self._panel.blockSignals(False)
+
+    def _on_panel_selection_changed(self) -> None:
+        """点面板某一行 → 选中场景里对应的 ROI。"""
+        rows = self._panel.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        if not 0 <= row < len(self._panel_items):
+            return
+        item = self._panel_items[row]
+        if not item.isSelected():
+            self.view.select_roi_item(item)
+
     # ------------------------------------------------------------------ 状态
 
     def _update_status(self) -> None:
@@ -404,7 +813,12 @@ class MainWindow(QMainWindow):
         if self._index < 0:
             self._label_roi.setText("")
             return
-        self._label_roi.setText(f"标注 {self.view.roi_count()}")
+        items = self.view.roi_items()
+        recognized = sum(1 for item in items if item.text())
+        text = f"标注 {len(items)}"
+        if recognized:
+            text += f" / 已识别 {recognized}"
+        self._label_roi.setText(text)
 
     def _on_zoom_changed(self, scale: float) -> None:
         self._label_zoom.setText(f"缩放 {scale * 100:.0f}%")
@@ -436,6 +850,12 @@ class MainWindow(QMainWindow):
             "  Ctrl+S                              保存当前图的标注\n"
             "  Esc                                 放弃正在拉的矩形 / 取消选中\n"
             "  标注自动保存在图像旁的 <文件名>.roi.json，切图时自动保存与恢复\n"
+            "\n"
+            "OCR\n"
+            "  Ctrl+R                              识别选中的标注\n"
+            "  Ctrl+Shift+R                        识别当前图的全部标注\n"
+            "  OCR → 识别模型                       切换识别模型（当前只有 manga-ocr）\n"
+            "  识别结果挂在对应的 ROI 上，随标注一起写进 <文件名>.roi.json\n"
             "\n"
             "鼠标\n"
             "  中键拖动                             平移画布\n"
@@ -482,6 +902,7 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self._cancel_ocr()  # 关窗前先停掉识别，让已经识别出来的结果落盘
         self._flush_rois()  # 关窗前保存当前图的标注
         self._settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(event)

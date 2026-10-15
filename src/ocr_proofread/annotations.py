@@ -1,8 +1,8 @@
 """ROI 标注的数据结构与持久化。
 
-这一层不依赖任何界面控件：``Roi`` 是四个浮点数加一段可选的识别文本，``RoiStore``
-负责内存缓存与 JSON 边车文件读写。存储按"一张图一份"组织，文件放在图像旁边，命名为
-``<图像文件名>.roi.json``（``page1.png`` 对应 ``page1.png.roi.json``），
+这一层不依赖任何界面控件：``Roi`` 是四个浮点数加一段可选的识别文本、一个排序号，
+``RoiStore`` 负责内存缓存与 JSON 边车文件读写。存储按"一张图一份"组织，文件放在图像
+旁边，命名为 ``<图像文件名>.roi.json``（``page1.png`` 对应 ``page1.png.roi.json``），
 这样复制或移动图像文件夹时标注跟着走，不同文件夹里的同名图也不会互相覆盖。
 
 坐标系与 :mod:`ocr_proofread.image_view` 一致：单位是图像像素，原点在图像左上角。
@@ -22,9 +22,21 @@ from PySide6.QtCore import QRectF
 SIDECAR_SUFFIX = ".roi.json"
 
 #: 标注文件格式版本，便于以后升级。
-#: v1 只有几何；v2 起每条记录可以带可选的 ``text``（OCR 识别结果）。读盘不校验版本，
-#: 缺少 ``text`` 的 v1 文件照常读入。
-FORMAT_VERSION = 2
+#: v1 只有几何；v2 起每条记录可以带可选的 ``text``（OCR 识别结果）；v3 起再带可选的
+#: ``index``（这张图上的排序号，从 1 开始）。读盘不校验版本：缺 ``text`` 的 v1 文件
+#: text 视为空串，缺 ``index`` 的 v1/v2 文件按"还没排过号"处理，由上层重新编号。
+FORMAT_VERSION = 3
+
+
+def _coerce_index(value: object) -> int:
+    """把写盘或手改过的 ``index`` 收敛成 >= 0 的整数；认不出来就当没排过号（0）。"""
+    if isinstance(value, bool):  # bool 是 int 的子类，先挡掉
+        return 0
+    if isinstance(value, int):
+        return max(value, 0)
+    if isinstance(value, float) and value.is_integer():
+        return max(int(value), 0)
+    return 0
 
 
 @dataclass(frozen=True)
@@ -33,6 +45,10 @@ class Roi:
 
     ``text`` 是这个区域最近一次的 OCR 结果，空串表示还没识别过。文本不参与几何运算，
     只跟着标注一起存取；等于说"识别结果挂在 ROI 上"。
+
+    ``index`` 是这个框在**本张图上的顺序**（1、2、3…）：初始就是框的创建顺序，之后可以
+    在排序模式里按点击顺序重排。0 表示"还没有排过号"，只可能出现在读进来的老文件里，
+    上层会按文件里的先后重新编号。
     """
 
     x: float
@@ -40,6 +56,7 @@ class Roi:
     width: float
     height: float
     text: str = ""
+    index: int = 0
 
     def __post_init__(self) -> None:
         if self.width < 0 or self.height < 0:
@@ -51,19 +68,24 @@ class Roi:
 
     def with_text(self, text: str) -> Roi:
         """返回一个只换了识别文本的副本（:class:`Roi` 本身不可变）。"""
-        return Roi(self.x, self.y, self.width, self.height, text)
+        return Roi(self.x, self.y, self.width, self.height, text, self.index)
 
     @classmethod
-    def from_rect(cls, rect: QRectF, text: str = "") -> Roi:
+    def from_rect(cls, rect: QRectF, text: str = "", index: int = 0) -> Roi:
         """从 Qt 矩形构造，负宽高会被规整。"""
         normalized = QRectF(rect).normalized()
         return cls(
-            normalized.x(), normalized.y(), normalized.width(), normalized.height(), text
+            normalized.x(),
+            normalized.y(),
+            normalized.width(),
+            normalized.height(),
+            text,
+            index,
         )
 
-    def to_dict(self) -> dict[str, float | str]:
-        """转成写盘用的字典；没识别过的标注不写 ``text`` 字段。"""
-        data: dict[str, float | str] = {
+    def to_dict(self) -> dict[str, float | str | int]:
+        """转成写盘用的字典；没识别过的标注不写 ``text``，没排过号的不写 ``index``。"""
+        data: dict[str, float | str | int] = {
             "x": round(self.x, 2),
             "y": round(self.y, 2),
             "w": round(self.width, 2),
@@ -71,6 +93,8 @@ class Roi:
         }
         if self.text:
             data["text"] = self.text
+        if self.index > 0:
+            data["index"] = self.index
         return data
 
     @classmethod
@@ -90,7 +114,14 @@ class Roi:
         if roi.width <= 0 or roi.height <= 0:
             return None
         text = data.get("text", "")
-        return roi.with_text(text) if isinstance(text, str) else roi
+        return cls(
+            roi.x,
+            roi.y,
+            roi.width,
+            roi.height,
+            text if isinstance(text, str) else "",
+            _coerce_index(data.get("index", 0)),
+        )
 
 
 def sidecar_path(image_path: str | Path) -> Path:
@@ -161,7 +192,8 @@ class RoiStore:
     """每张图一份标注：内存缓存 + 边车文件。
 
     读取是惰性的——``get()`` 第一次访问某张图时读盘并缓存；``set()`` 更新缓存，
-    只有内容真的变了才写盘，因此反复切图不会反复碰磁盘。
+    只有内容真的变了才写盘，因此反复切图不会反复碰磁盘。这里的"内容"包括每条标注的
+    排序号，所以重排顺序同样会被写进文件。
     """
 
     def __init__(self) -> None:
@@ -187,7 +219,7 @@ class RoiStore:
             self._rois[key] = load_rois(key)
             self._loaded.add(key)
 
-        new = [Roi(r.x, r.y, r.width, r.height, r.text) for r in rois]
+        new = [Roi(r.x, r.y, r.width, r.height, r.text, r.index) for r in rois]
         if new == self._rois[key]:
             return False
         self._rois[key] = new

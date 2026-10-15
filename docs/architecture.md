@@ -5,10 +5,11 @@
 
 ## 设计边界
 
-当前版本做"浏览 + 框选 + 每图标注存取 + OCR 识别 + 文本编辑"：打开图像、缩放平移、上下张
-切换、左键拖出矩形并调整、切图时自动保存与恢复标注，对选中的或全部的 ROI 跑识别、
+当前版本做"浏览 + 框选 + 每图标注存取 + ROI 排序 + OCR 识别 + 文本编辑"：打开图像、缩放平移、
+上下张切换、左键拖出矩形并调整、切图时自动保存与恢复标注，对选中的或全部的 ROI 跑识别、
 把文本挂在对应的 ROI 上一起落盘，选中标注时在它旁边显示这段文本（横排 / 竖排可切），
-并且可以双击就地改掉它。批量替换、逐字校对与导出等更完整的校对工作流不在范围内。
+并且可以双击就地改掉它。每个 ROI 还有一个"本张图上的顺序号"，默认是创建顺序，也可以在
+排序模式里按点击顺序重排。批量替换、逐字校对与导出等更完整的校对工作流不在范围内。
 
 由此定下两条贯穿全项目的原则：
 
@@ -73,35 +74,75 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 ## 标注数据的生命周期
 
 ```
-切图 / 关窗 / Ctrl+S / 识别完成 / 文本编辑被采纳    场景 ──ImageView.rois()──▶ RoiStore.set(图像路径, 标注)
-                                                              │ 内容有变化才写盘
-                                                              ▼
-                                                 <图像文件名>.roi.json（原子替换）
+切图 / 关窗 / Ctrl+S / 识别完成 / 文本编辑被采纳 / 排序模式里每点中一个框
+        │
+        ▼
+ImageView.rois() ──▶ RoiStore.set(图像路径, 标注) ──▶ <图像文件名>.roi.json（原子替换）
+                                  （内容有变化才写盘）
 ```
 
 - **落盘时机**：切上一张 / 下一张、重新打开一组图像、关窗、`Ctrl+S`、一批识别结束
-  （`_finalize_ocr()` 会立刻 `_flush_rois()`），以及一次文本编辑被采纳（`roiTextChanged`
-  → `_flush_rois()`），所以识别结果和手改的字都不用等切图就已经在文件里了。
-  空标注不落盘，已存在的边车文件会被删除，所以从没标过的图不会多出文件。
+  （`_finalize_ocr()` 会立刻 `_flush_rois()`）、一次文本编辑被采纳（`roiTextChanged`
+  → `_flush_rois()`），以及排序模式里每点中一个框（`roiOrderChanged` → `_flush_rois()`，
+  排序是"点一下算一次"的操作，丢了不好重来）。所以识别结果、手改的字和新排的顺序都不用
+  等切图就已经在文件里了。空标注不落盘，已存在的边车文件会被删除，所以从没标过的图不会
+  多出文件。
 - **`RoiStore` 是唯一读写标注文件的地方**：内存缓存 + 惰性读盘，内容没变就不碰磁盘，
   因此反复翻页不会反复写文件，也不会把 mtime 刷得满天飞。
 - **存储位置**：图像旁边、与图像同名加后缀（`page_02.png` → `page_02.png.roi.json`）。
   边车文件不是图像扩展名，`collect_images()` 不会把它扫进浏览列表。
 - **文件格式**：`version` 用于以后升级，读取时忽略未知字段；坏记录逐条跳过，
   不让一条烂数据作废整份文件。坐标写盘前四舍五入到 2 位小数（误差远小于 1 像素）。
-  v2 起每条记录可以带可选的 `text`（该 ROI 的识别结果），没识别过就不写这个字段，
-  v1 老文件照常读入（`text` 视为空串）。
+  v2 起每条记录可以带可选的 `text`（该 ROI 的识别结果），v3 起再带可选的 `index`
+  （顺序号，见 [ROI 的顺序与排序模式](#roi-的顺序与排序模式)）；两个字段都是"没有就不写"，
+  v1 / v2 老文件照常读入（`text` 视为空串、`index` 视为没排过号）。
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "image": "page_02.png",
   "annotations": [
-    { "x": 150.0, "y": 630.0, "w": 940.0, "h": 70.0, "text": "認識されたテキスト" },
-    { "x": 150.0, "y": 720.0, "w": 940.0, "h": 70.0 }
+    { "x": 150.0, "y": 720.0, "w": 940.0, "h": 70.0, "index": 1 },
+    { "x": 150.0, "y": 630.0, "w": 940.0, "h": 70.0, "text": "認識されたテキスト", "index": 2 }
   ]
 }
 ```
+
+## ROI 的顺序与排序模式
+
+每个 ROI 在**本张图上**有一个从 1 开始的顺序号（`Roi.index` / `RoiItem.order()`），
+它决定结果面板的行序、`rois()` 的返回顺序（也就是存盘顺序）、`Ctrl+Shift+R` 识别全部时
+的处理顺序：
+
+```
+框选新建 / 读盘            set_rois 按 index 排序后重编号 1..N（没有 index 的老文件按文件先后）
+        │
+        ▼
+RoiItem.order()  ◀── 排序模式：点一个就把已点的排到前面，其余保持原相对次序接在后面
+        │
+        ▼
+to_roi() ──▶ Roi.index ──▶ <图像文件名>.roi.json 的 "index" 字段
+```
+
+- **初始顺序 = 创建顺序**，不是坐标顺序。新建的框取"现有最大序号 + 1"排在最后；
+  读盘时按 `index` 排（`_load_order_key()`；老文件没有 `index`，稳定排序保持文件里的
+  先后），然后统一重编号，所以序号永远是连续的 1..N。删掉几个之后同样重编号，
+  不留空档（`_renumber()`）。
+- **顺序号存在图元上**（`RoiItem.set_order()`），和 `text` 一样由 `to_roi()` 带出去，
+  所以"内存里的顺序"和"文件里的顺序"不会各说各话；`RoiStore.set()` 比较的是含 `index`
+  的完整内容，重排顺序同样会触发写盘。
+- **排序模式只作用于单张图**：`ImageView.set_sort_mode()` 是这张图上的临时状态，
+  `set_image()` 会先退出它。进入时所有框都算"没点到"（角标 `?`），每点一个就把它排到
+  已点队列末尾并整体重编号——已点的拿 1..k，没点的按原顺序接在后面，因此点一半退出也
+  不会丢框。已经点过的框再点一次不做改动，只由上层在状态栏说明。
+- **模式下的鼠标语义由视图收口**：`ImageView.mousePressEvent()` 在左键分支之前拦下排序
+  模式，只做 `_pick_for_sort()`，不调用 `scene` 的默认处理——所以既不新建矩形，也不选中
+  或拖动图元；中键 / 空格平移与滚轮缩放的判断都在它之前，照常可用。`Esc` 在
+  `keyPressEvent()` 里退出模式。
+- **反馈靠角标**：`OrderBadge` 是 `RoiItem` 的子图元（和文本框一样带
+  `ItemIgnoresTransformations`，位置锚在矩形左上角、自身按屏幕像素绘制），只在排序模式下
+  显示，所以"哪个已经排到第几号"不用看右侧面板。它不接受鼠标按键，但 `_roi_at()` 仍然把
+  它上溯到父图元，点角标等于点这个框。
 
 ## 分层与模块职责
 
@@ -128,24 +169,27 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 - **`app.py` / `MainWindow`**：唯一持有"图像列表 + 当前索引 + 标注存储 + OCR 任务"的地方。
   菜单、快捷键、拖放、命令行参数最终都汇入 `open_paths()`。窗口大小、上次目录、上次用的
   识别模型、文本框排版方向与字号通过 `QSettings` 持久化；结果面板里双击改文本也在这里
-  收口（`_on_panel_item_changed`）。
+  收口（`_on_panel_item_changed`），ROI 排序模式的菜单勾选、状态栏提示与"每点一次就落盘"
+  同样在这里接线（`_toggle_sort_rois()` / `_on_roi_order_changed()`）。
 - **`image_view.py` / `ImageView`**：只负责当前这张图的变换（缩放、平移）、场景管理，
   "左键在图像空白处拉矩形"的交互，双击图元后的文本就地编辑（编辑器是视口的子控件，
-  见 [扩展点与约定](#扩展点与约定)），以及文本框的排版方向、字号与每次重算；对外暴露
-  `set_image()`、`image()`、`set_rois()` / `rois()`、`select_roi_item()`、
-  `set_hand_mode()`、`set_text_direction()`、`set_text_font_size()`、
+  见 [扩展点与约定](#扩展点与约定)），文本框的排版方向、字号与每次重算，以及这张图上的
+  ROI 顺序（读盘重编号、新建排最后、删除后补号）与 ROI 排序模式；对外暴露
+  `set_image()`、`image()`、`set_rois()` / `rois()`、`roi_items()`、`select_roi_item()`、
+  `set_hand_mode()`、`set_sort_mode()`、`set_text_direction()`、`set_text_font_size()`、
   `begin_text_edit()` / `commit_text_edit()` / `cancel_text_edit()`，以及
-  `zoomChanged`、`roisChanged`、`roiTextChanged`、`textFontChanged`、
-  `textFontLimitReached`、`selectionChanged` 信号。
+  `zoomChanged`、`roisChanged`、`roiOrderChanged`、`sortModeChanged`、`sortPicked`、
+  `roiTextChanged`、`textFontChanged`、`textFontLimitReached`、`selectionChanged` 信号。
 - **`roi_item.py` / `RoiItem`**：单个矩形的外观与交互（`ItemIsMovable` + 八个手柄），
-  用 `mapRectToScene()` 与图像坐标互转；另外挂着这个框的 OCR 文本（`text()` / `set_text()`），
-  文本由上层编辑好后写回。手柄与文本框都是它的子图元，对 `ImageView` 透明；
-  `setRect()` 被重写，改几何时顺带把两类子图元同步过去。
+  用 `mapRectToScene()` 与图像坐标互转；另外挂着这个框的 OCR 文本（`text()` / `set_text()`）
+  与顺序号（`order()` / `set_order()`），都由上层维护好后经 `to_roi()` 一起带走。
+  手柄、文本框与排序角标（`OrderBadge`）都是它的子图元，对 `ImageView` 透明；
+  `setRect()` 被重写，改几何时顺带把这几类子图元同步过去。
 - **`text_box.py`**：标注旁那个小框。`TextDirection` 是排版方向（横排 / 竖排）这个设定
   本身，`RoiTextBox` 负责量尺寸、贴边与绘制，只用 QtCore / QtGui 的字体度量与画笔，
   不含控件；它也持有字号，但"到底能调多大"要问视图喂进来的现场（见下）。
-- **`annotations.py`**：纯数据层，不含任何控件。`Roi` 是四个浮点数加一段可选的识别文本，
-  `RoiStore` 管内存缓存与边车文件读写。可在没有界面的场景下单独使用或测试。
+- **`annotations.py`**：纯数据层，不含任何控件。`Roi` 是四个浮点数加一段可选的识别文本
+  与一个顺序号，`RoiStore` 管内存缓存与边车文件读写。可在没有界面的场景下单独使用或测试。
 - **`images.py`**：纯函数式的扫描、自然排序与解码，返回 `Path` 列表和 `QImage`，
   不引用任何 Qt 控件类型。可在没有界面的场景下单独使用或测试。
 - **`ocr.py`**：模型注册表（`OCR_MODELS` / `create_engine()`）、`crop_roi()` 裁剪、
@@ -193,12 +237,17 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
 - `ImageView.set_image()` 会**清空整个场景**。它只管底图、不碰标注数据；切图后必须由上层
   紧接着调用 `set_rois()`，否则这张图的标注看起来就"丢了"。
 - `RoiItem` 只用平移（`pos` + 矩形），不旋转不缩放，所以 `to_roi()` 里一次 `mapRectToScene()`
-  就能得到图像坐标，识别文本顺带带出去。以后若要支持旋转，出口仍只有 `to_roi()` 一处，
-  但读回时要注意 `pos` 与 `rect` 的拆分。
+  就能得到图像坐标，识别文本与顺序号顺带带出去。以后若要支持旋转，出口仍只有 `to_roi()`
+  一处，但读回时要注意 `pos` 与 `rect` 的拆分。
+- **ROI 顺序只有一个出口**：顺序号存在 `RoiItem.order()` 上，`ImageView.roi_items()` 按它
+  排序，`rois()`（存盘）、结果面板、批量识别都从这个排序结果出发。改顺序只走
+  `set_order()` / `_renumber()` / `_pick_for_sort()` 三处，别再让别的代码按坐标排——
+  "按坐标排"正是这一版要改掉的老行为。
 - 左键在图像空白处是"拉新矩形"，落在已有图元上则交回场景做选中 / 移动 / 缩放，判断在
   `ImageView._begin_roi()`。不可见的图元（未选中图元的手柄）不会参与命中，这是 Qt 的行为，
   依赖它比依赖 `isVisible()` 自己过滤更可靠。双击另走 `ImageView.mouseDoubleClickEvent()`
-  （命中手柄或文本框时上溯到父图元），不经过场景。
+  （命中手柄、文本框或排序角标时上溯到父图元），不经过场景。排序模式下这两个入口都先被
+  `mousePressEvent()` 的左键分支拦掉，见 [ROI 的顺序与排序模式](#roi-的顺序与排序模式)。
 - **标注旁的文本框**：`RoiTextBox` 是 `RoiItem` 的子图元（不是在场景里另挂一批），
   这样"跟着标注移动 / 缩放 / 删除"和"只有选中才显示"都由 Qt 的父子关系与
   `ItemSelectedHasChanged` 白送，视图不必维护任何映射表。它带
@@ -222,12 +271,13 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
   所以画布缩放到 2% 或 4000% 输入手感都一样（`ItemIgnoresTransformations` 的那套只解决
   绘制，管不了输入控件）。采纳时先 `RoiItem.set_text()` 再发 `roiTextChanged`；这个信号与
   `roisChanged` 分开——前者是"文本内容变了、该落盘"，后者是"图元增删了、面板要重填"。
-  上层在 `_flush_rois()`、`_save_rois()`、`_start_ocr()` 开头都会 `commit_text_edit()`，
-  所以切图、`Ctrl+S`、识别之前正在敲的字不会丢；`_finalize_ocr()` 则先 `cancel_text_edit()`，
-  让识别结果说了算，避免编辑器里的旧文本在收尾时盖回去。
+  上层在 `_flush_rois()`、`_save_rois()`、`_start_ocr()`、`ImageView.set_sort_mode()` 开头都会
+  `commit_text_edit()`，所以切图、`Ctrl+S`、识别、进排序模式之前正在敲的字不会丢；
+  `_finalize_ocr()` 则先 `cancel_text_edit()`，让识别结果说了算，避免编辑器里的旧文本在
+  收尾时盖回去。
 - **`RoiItem.setRect()` 是子图元的同步点**：`QGraphicsRectItem.setRect()` 不会通知子图元，
-  画新框（`ImageView._resize_drawing()` 直接调 `setRect()`）时手柄和文本框会留在旧位置，
-  所以 `RoiItem` 重写了它，一次把手柄与文本框都摆好。以后再加"挂在矩形上的东西"，
+  画新框（`ImageView._resize_drawing()` 直接调 `setRect()`）时手柄、文本框与排序角标会留在
+  旧位置，所以 `RoiItem` 重写了它，一次把这几个子图元都摆好。以后再加"挂在矩形上的东西"，
   同步逻辑加在这一处，别散到调用方。
 - **排版的边界**：竖排是按字符逐格摆放的（原文里的换行就是换列），不做日语竖排里"ー、（）"这类
   需要旋转的处理，拉丁字母也不转 90°。Qt 的 `QTextLayout` 没有竖排模式，要支持上面这些
@@ -240,7 +290,7 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
   这些情况。抓手模式下左键按下在 `_begin_roi()` 之前就被拦成平移，所以不会新建矩形、
   也不会拖动已有图元；过滤器只读不消费（返回 `False`），其他控件照常使用空格。
 - 手柄用 `ItemIgnoresTransformations` 绘制，屏幕尺寸恒为 9px；改动这块要复查极端缩放
-  （2% 和 4000%）下的手感。
+  （2% 和 4000%）下的手感。排序角标同理，屏幕尺寸恒为 20px。
 - 移动与缩放都被夹在图像矩形内（`RoiItem._bounds`），拖不出画面，也拖不成一条线。
 - **加新 OCR 模型**：在 `ocr.py` 的 `OCR_MODELS` 里加一条 `OcrModel(name, label, factory)`，
   实现 `recognize(QImage) -> str`（失败抛 `OcrError`）即可，菜单与模型选择会自动出现这一项。
@@ -264,9 +314,16 @@ uv run python tests/smoke_test.py
 ROI 相关的部分自己造 `QMouseEvent` 并带上按键状态——`QTest.mouseMove()` 发的事件不带按键，
 场景不会认为在拖图元，测不出移动与缩放。覆盖：左键拖出矩形、误点击不留碎图元、
 切图保存与恢复、拖动本体移动、拖手柄缩放、拖不出图像范围、`Delete` 删除，
-以及 `RoiStore` 的写盘、去重、损坏文件容错、空标注删文件与 `text` 字段的读写。
+以及 `RoiStore` 的写盘、去重、损坏文件容错、空标注删文件与 `text` / `index` 字段的读写
+（含 v1 / v2 老文件的兼容、认不出来的 `index` 容错）。
 空格抓手另有覆盖：按住空格拖动只平移画布（滚动条动了）而不留新标注，从已有图元上
 按下也不改动它，松开空格后左键恢复成拉矩形。
+
+ROI 排序的覆盖：初始顺序就是创建顺序（故意让坐标顺序与创建顺序相反）、新画的框排最后、
+删除后序号补成连续的 1..N、面板第一列与行序跟着排序号；排序模式下进入后角标全为 `?`、
+按点击顺序排成 1、2、3、重复点已编号的框不改动、点空白不新建、拖动不动图元、双击不进
+文本编辑、每点一次就落盘、`Esc` 退出后角标收起、没点到的框按原顺序接在后面、重新进入
+从头排、切图自动退出且切回来顺序还在。
 
 文本编辑的覆盖：双击图元打开就地编辑器并带出原文本、`Ctrl+Enter` 采纳后立刻落盘、
 `Esc` 放弃不留痕、没识别过的标注也能编辑、编辑到一半切图或 `Ctrl+S` 会先收下正在敲的

@@ -1,7 +1,8 @@
-"""QGraphicsView 子类：显示单张图像，负责缩放、平移、ROI 框选与文本就地编辑。
+"""QGraphicsView 子类：显示单张图像，负责缩放、平移、ROI 框选、排序与文本就地编辑。
 
 ``set_image()`` 会清空整个场景，ROI 图元随之消失；切图后需要由上层重新调用
-:meth:`ImageView.set_rois`。视图不保存跨图状态，只持有"当前这一张图"。
+:meth:`ImageView.set_rois`。视图不保存跨图状态，只持有"当前这一张图"——排序模式
+（:meth:`ImageView.set_sort_mode`）也是这张图上的临时状态，切图即退出。
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from .annotations import Roi
-from .roi_item import MIN_SIZE, RoiHandle, RoiItem
+from .roi_item import MIN_SIZE, OrderBadge, RoiHandle, RoiItem
 from .text_box import (
     DEFAULT_FONT_SIZE,
     DEFAULT_TEXT_DIRECTION,
@@ -47,6 +48,15 @@ ZOOM_STEP = 1.25
 #: 就地文本编辑器的最小尺寸（屏幕像素）；小的 ROI 也要能编辑得下去
 TEXT_EDITOR_MIN_WIDTH = 160
 TEXT_EDITOR_MIN_HEIGHT = 64
+
+
+def _load_order_key(roi: Roi) -> tuple[int, int]:
+    """读盘时的排序键：有 ``index`` 的按号排，没有的（v1/v2 老文件）排在后面。
+
+    ``sorted`` 是稳定排序，所以没有号的那批保持文件里的先后——老文件里的顺序就是
+    当年写盘时的坐标顺序，正好当它们的初始顺序用。
+    """
+    return (0, roi.index) if roi.index > 0 else (1, 0)
 
 
 class _RoiTextEditor(QPlainTextEdit):
@@ -110,7 +120,9 @@ class ImageView(QGraphicsView):
     * 左键在图像空白处拖动 —— 拉出一个新矩形；落在已有图元上时交给场景，
       即选中 / 拖动 / 拖手柄缩放
     * 双击已有图元或它的文本框 —— 就地编辑这个 ROI 的文本（见 :meth:`begin_text_edit`）
-    * Esc —— 放弃正在拉的矩形，或取消选中
+    * Esc —— 放弃正在拉的矩形，或取消选中，或退出排序模式
+    * 排序模式（:meth:`set_sort_mode`）—— 左键点图元给它们编号（1、2、3…），
+      此时不拉新矩形、不拖动图元；只作用于当前这张图
     """
 
     #: 当前缩放比例，1.0 表示 100%
@@ -118,6 +130,15 @@ class ImageView(QGraphicsView):
 
     #: 场景里的 ROI 数量发生变化（新增、删除、整批替换）时发出；移动与缩放不发
     roisChanged = Signal()
+
+    #: ROI 的先后顺序（排序号）变了时发出；面板要跟着重排
+    roiOrderChanged = Signal()
+
+    #: 进出排序模式（参数是进入还是退出）时发出
+    sortModeChanged = Signal(bool)
+
+    #: 排序模式里点了一个 ROI：（图元, 它的新序号）；序号为 0 表示它已经排过号、本次没动
+    sortPicked = Signal(object, int)
 
     #: 就地编辑文本被采纳时发出（放弃编辑、没有改动时不发）
     roiTextChanged = Signal()
@@ -157,6 +178,8 @@ class ImageView(QGraphicsView):
         self._hand_mode = False  # 空格按住：左键拖动 = 平移画布
         self._drawing: RoiItem | None = None  # 正在左键拉出的矩形
         self._draw_origin = QPointF()
+        self._sort_mode = False  # ROI 排序模式：左键点击 = 给框编号
+        self._sort_assigned: list[RoiItem] = []  # 排序模式里已经点过的框（按点击先后）
         self._text_editor: _RoiTextEditor | None = None  # 双击图元后盖上去的编辑器
         self._text_item: RoiItem | None = None  # 编辑器正在改的那个图元
         self._text_direction = DEFAULT_TEXT_DIRECTION  # 标注旁文本框的排版方向
@@ -186,8 +209,10 @@ class ImageView(QGraphicsView):
         """替换当前显示的图像；传入 ``None`` 表示清空。
 
         注意：这里会清空整个场景，其中的 ROI 图元会一并被移除。切图后由上层
-        重新调用 :meth:`set_rois` 恢复该图的标注。
+        重新调用 :meth:`set_rois` 恢复该图的标注。排序模式只作用于单张图，所以
+        切图前先在这里退出（顺序本身已经写回图元，不会丢）。
         """
+        self.set_sort_mode(False)
         self.cancel_text_edit()  # 编辑器挂在图元上，图元要没了就先撤掉
         self._scene.clear()
         self._item = None
@@ -218,30 +243,40 @@ class ImageView(QGraphicsView):
         return QRectF(self._item.boundingRect()) if self._item is not None else QRectF()
 
     def roi_items(self) -> list[RoiItem]:
-        """场景里的 ROI 图元，按从上到下、从左到右排序（保证存盘顺序稳定）。"""
+        """场景里的 ROI 图元，按排序号（这个框在本张图上的顺序）排列。
 
-        def sort_key(item: RoiItem) -> tuple[float, float]:
+        排序号由 :meth:`set_rois`（读盘顺序）、新建（排在最后）和排序模式共同维护，
+        正常情况下互不相同；万一撞号（手改过的文件）才用坐标兜底，保证顺序稳定。
+        """
+
+        def sort_key(item: RoiItem) -> tuple[int, float, float]:
             roi = item.to_roi()
-            return (roi.y, roi.x)
+            return (roi.index, roi.y, roi.x)
 
         items = [item for item in self._scene.items() if isinstance(item, RoiItem)]
         items.sort(key=sort_key)
         return items
 
     def rois(self) -> list[Roi]:
-        """当前图像的全部标注（图像像素坐标）。"""
+        """当前图像的全部标注（图像像素坐标），按排序号排列。"""
         return [item.to_roi() for item in self.roi_items()]
 
     def roi_count(self) -> int:
         return len(self.roi_items())
 
     def set_rois(self, rois: Iterable[Roi]) -> None:
-        """清掉现有 ROI，换成给定的这一批；由上层在切图后调用。"""
+        """清掉现有 ROI，换成给定的这一批；由上层在切图后调用。
+
+        读进来的先后就是这张图上的顺序：带 ``index`` 的按号排（老文件没有号，就按
+        文件里的先后），随后统一重编号成连续的 1..N，所以序号永远是干净的。
+        """
         self.cancel_text_edit()
+        self._sort_assigned = []
         for item in self.roi_items():
             self._scene.removeItem(item)
-        for roi in rois:
-            self._add_roi_item(roi.as_rect(), roi.text)
+        for position, roi in enumerate(sorted(rois, key=_load_order_key), start=1):
+            self._add_roi_item(roi.as_rect(), roi.text, order=position)
+        self._refresh_order_badges()
         self.roisChanged.emit()
 
     def clear_rois(self) -> None:
@@ -251,16 +286,19 @@ class ImageView(QGraphicsView):
         for item in items:
             self._scene.removeItem(item)
         if items:
-            self.roisChanged.emit()
+            self._after_rois_removed()
 
     def delete_selected_rois(self) -> int:
-        """删除选中的 ROI，返回删掉的数量。"""
+        """删除选中的 ROI，返回删掉的数量。
+
+        删完把剩下的重编号成 1..N，序号不留空档。
+        """
         self.cancel_text_edit()
         selected = [item for item in self.roi_items() if item.isSelected()]
         for item in selected:
             self._scene.removeItem(item)
         if selected:
-            self.roisChanged.emit()
+            self._after_rois_removed()
         return len(selected)
 
     def select_roi_item(self, item: RoiItem, *, center: bool = True) -> None:
@@ -273,7 +311,10 @@ class ImageView(QGraphicsView):
         if center:
             self.centerOn(item)
 
-    def _add_roi_item(self, rect: QRectF, text: str = "") -> RoiItem:
+    def _add_roi_item(
+        self, rect: QRectF, text: str = "", *, order: int | None = None
+    ) -> RoiItem:
+        """造一个 ROI 图元并挂进场景；``order`` 为 ``None`` 时排在最后。"""
         bounds = self.image_rect()
         item = RoiItem(
             rect,
@@ -281,9 +322,90 @@ class ImageView(QGraphicsView):
             text=text,
             text_direction=self._text_direction,
             text_font_size=self._text_font_size,
+            order=self._next_order() if order is None else order,
         )
         self._scene.addItem(item)
         return item
+
+    def _next_order(self) -> int:
+        """新画的框排在最后：现有最大序号 + 1（还没有框时是 1）。"""
+        return max((item.order() for item in self.roi_items()), default=0) + 1
+
+    def _renumber(self) -> None:
+        """按当前顺序把序号重排成连续的 1..N。"""
+        for position, item in enumerate(self.roi_items(), start=1):
+            item.set_order(position)
+
+    def _after_rois_removed(self) -> None:
+        """删掉图元之后的收尾：重编号、清理排序现场、刷新角标，最后通知上层。"""
+        self._renumber()
+        self._prune_sort_session()
+        self._refresh_order_badges()
+        self.roisChanged.emit()
+        if self._sort_mode and not self.roi_items():
+            self.set_sort_mode(False)  # 图都删光了，排序模式没有意义了
+
+    # ------------------------------------------------------------------ 排序
+
+    @property
+    def sort_mode(self) -> bool:
+        """是否处于 ROI 排序模式（只作用于当前这张图）。"""
+        return self._sort_mode
+
+    def set_sort_mode(self, enabled: bool) -> None:
+        """开关排序模式：进入后按鼠标点击顺序，从 1 开始依次给 ROI 编号。
+
+        进入时把每个框都当作"还没排过号"（角标显示灰色的 ?）。每点中一个框，就把它
+        排到已点队列的末尾，其余框保持原有相对次序跟在后面，然后整体重编号——所以
+        中途退出也不会丢框，没点到的只是延续原来的先后。``set_image()`` 会先退出
+        这个模式（排序模式只作用于单张图）。
+        """
+        if enabled == self._sort_mode:
+            return
+        self._sort_mode = enabled
+        self._sort_assigned = []
+        if enabled:
+            self.commit_text_edit()  # 正在手改的字先收下，跟画布上按下左键一个道理
+            self._scene.clearSelection()  # 别让手柄 / 文本框挡住要点的框
+        self._refresh_order_badges()
+        self._update_cursor()
+        self.sortModeChanged.emit(enabled)
+
+    def _refresh_order_badges(self) -> None:
+        """让每个框的角标与当前状态一致：排序模式下才显示，本次没点到的显示 ?。"""
+        for item in self.roi_items():
+            item.set_order_badge(
+                visible=self._sort_mode, pending=not self._is_sort_assigned(item)
+            )
+
+    def _is_sort_assigned(self, item: RoiItem) -> bool:
+        """这个框在本次排序里已经被点过了吗（比身份，不比重载的等号）。"""
+        return any(other is item for other in self._sort_assigned)
+
+    def _prune_sort_session(self) -> None:
+        """排序现场里已经被删掉的图元要清掉，别攥着不在场景里的引用。"""
+        if not self._sort_mode:
+            self._sort_assigned = []
+            return
+        self._sort_assigned = [
+            item for item in self._sort_assigned if item.scene() is self._scene
+        ]
+
+    def _pick_for_sort(self, item: RoiItem) -> int:
+        """排序模式下点中一个框：把它排到已点队列末尾，返回它的新序号。
+
+        已经点过的框原样不动，返回 0（表示本次没有改动）。重排之后已点的是
+        1..k，没点到的按原顺序接在 k+1..N。
+        """
+        if self._is_sort_assigned(item):
+            return 0
+        self._sort_assigned.append(item)
+        rest = [other for other in self.roi_items() if not self._is_sort_assigned(other)]
+        for position, target in enumerate(self._sort_assigned + rest, start=1):
+            target.set_order(position)
+        self._refresh_order_badges()
+        self.roiOrderChanged.emit()
+        return len(self._sort_assigned)
 
     # ---------------------------------------------------------------- 文本框
 
@@ -464,11 +586,13 @@ class ImageView(QGraphicsView):
         self._update_cursor()
 
     def _update_cursor(self) -> None:
-        """按当前状态刷新指针：平移中 = 抓紧，空格按住 = 张手，否则默认。"""
+        """按当前状态刷新指针：平移中 = 抓紧，空格按住 = 张手，排序 = 十字，否则默认。"""
         if self._pan_button is not None:
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
         elif self._hand_mode:
             self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+        elif self._sort_mode:
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         else:
             self.viewport().unsetCursor()
 
@@ -567,6 +691,13 @@ class ImageView(QGraphicsView):
             self._begin_pan(event.button(), event.position())
             event.accept()
             return
+        if self._sort_mode and event.button() == Qt.MouseButton.LeftButton:
+            # 排序模式：左键只管"给点中的框编号"，不新建矩形、不选中、不拖动
+            picked = self._roi_at(event.position())
+            if picked is not None:
+                self.sortPicked.emit(picked, self._pick_for_sort(picked))
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             box_owner = self._text_box_owner(event.position())
             if box_owner is not None:  # 点文本框 = 选中它所属的框，不在下面拉新矩形
@@ -580,7 +711,11 @@ class ImageView(QGraphicsView):
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         """双击已有图元或它的文本框 → 就地编辑它的文本；其余情况交给场景。"""
-        if event.button() == Qt.MouseButton.LeftButton and not self._hand_mode:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not self._hand_mode
+            and not self._sort_mode
+        ):
             item = self._roi_at(event.position())
             if item is not None and self.begin_text_edit(item):
                 event.accept()
@@ -588,14 +723,14 @@ class ImageView(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def _roi_at(self, viewport_pos: QPointF) -> RoiItem | None:
-        """视口坐标下命中的 ROI：手柄与文本框都算它们所在的那个框。"""
+        """视口坐标下命中的 ROI：手柄、文本框与排序角标都算它们所在的那个框。"""
         target = self.itemAt(viewport_pos.toPoint())
         if isinstance(target, RoiTextBox):
             under = self._roi_item_at(viewport_pos)
             if under is not None:
                 return under  # 框只是显示层：它盖住了别的标注时，那个标注优先
             target = target.parentItem()
-        elif isinstance(target, RoiHandle):
+        elif isinstance(target, (RoiHandle, OrderBadge)):
             target = target.parentItem()
         return target if isinstance(target, RoiItem) else None
 
@@ -660,6 +795,10 @@ class ImageView(QGraphicsView):
                 self._cancel_drawing()
                 event.accept()
                 return
+            if self._sort_mode:
+                self.set_sort_mode(False)
+                event.accept()
+                return
             if self._scene.selectedItems():
                 self._scene.clearSelection()
                 event.accept()
@@ -672,9 +811,9 @@ class ImageView(QGraphicsView):
         """判断这次左键按下要不要开始拉新矩形。
 
         落在已有图元（含手柄、标注旁的文本框）上时返回 ``False``，交给场景做
-        选中/移动/缩放；落在图像之外或还没有图像时不响应。
+        选中/移动/缩放；落在图像之外、还没有图像、或正在排序时不响应。
         """
-        if self._item is None:
+        if self._item is None or self._sort_mode:
             return False
         if isinstance(self.itemAt(viewport_pos.toPoint()), (RoiItem, RoiHandle, RoiTextBox)):
             return False

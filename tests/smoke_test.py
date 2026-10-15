@@ -248,7 +248,7 @@ def drag(widget, start: QPoint, end: QPoint, *, steps: int = 4) -> None:
 
 
 def same_rois(left, right, tolerance: float = 0.02) -> bool:
-    """两组标注是否一致（几何允许存盘四舍五入的误差，识别文本要求完全相同）。"""
+    """两组标注是否一致（几何允许存盘四舍五入的误差，文本与排序号要求完全相同）。"""
     if len(left) != len(right):
         return False
     return all(
@@ -257,6 +257,7 @@ def same_rois(left, right, tolerance: float = 0.02) -> bool:
         and abs(a.width - b.width) <= tolerance
         and abs(a.height - b.height) <= tolerance
         and a.text == b.text
+        and a.index == b.index
         for a, b in zip(left, right)
     )
 
@@ -299,7 +300,7 @@ def test_roi_store(root: Path) -> None:
     store.set(path, [])
     check("清空标注会删掉边车文件", not sidecar_path(path).exists())
 
-    recognized = [Roi(1, 2, 30, 40, "認識された"), Roi(50, 60, 70, 80)]
+    recognized = [Roi(1, 2, 30, 40, "認識された", 1), Roi(50, 60, 70, 80, "", 2)]
     store = RoiStore()
     store.set(path, recognized)
     check("识别文本随标注一起读回", same_rois(RoiStore().get(path), recognized),
@@ -309,13 +310,41 @@ def test_roi_store(root: Path) -> None:
           json.dumps(raw, ensure_ascii=False))
     check("没识别过的标注不写 text 字段", "text" not in raw["annotations"][1],
           json.dumps(raw["annotations"][1], ensure_ascii=False))
-    check("边车文件版本升到 2", raw["version"] == 2, str(raw["version"]))
+    check("边车文件版本升到 3", raw["version"] == 3, str(raw["version"]))
+    check("排序号随标注一起写盘",
+          [entry.get("index") for entry in raw["annotations"]] == [1, 2],
+          json.dumps(raw, ensure_ascii=False))
+    swapped = [Roi(1, 2, 30, 40, "認識された", 2), Roi(50, 60, 70, 80, "", 1)]
+    check("只有排序号变了也会写盘", store.set(path, swapped) is True)
+    check("内容完全没变时不写盘", store.set(path, swapped) is False)
+    check("重排后的顺序按传入顺序落盘", same_rois(RoiStore().get(path), swapped),
+          str(RoiStore().get(path)))
+
+    # 排序号：写盘、读回、字段容错
+    check("没排过号的标注不写 index 字段", "index" not in Roi(1, 2, 3, 4).to_dict(),
+          json.dumps(Roi(1, 2, 3, 4).to_dict()))
+    check("with_text 不丢排序号", Roi(1, 2, 3, 4, "", 7).with_text("x").index == 7)
+    check("from_rect 能带上排序号", Roi.from_rect(QRectF(1, 2, 3, 4), "x", 5).index == 5)
+    bad_index = Roi.from_dict({"x": 1, "y": 2, "w": 3, "h": 4, "index": "第二个"})
+    check("认不出来的 index 当作没排过号", bad_index is not None and bad_index.index == 0,
+          str(bad_index))
+    negative = Roi.from_dict({"x": 1, "y": 2, "w": 3, "h": 4, "index": -3})
+    check("负数 index 被夹成 0", negative is not None and negative.index == 0,
+          str(negative))
 
     legacy = sidecar_path(path)
     legacy.write_text('{"version": 1, "annotations": [{"x": 1, "y": 2, "w": 3, "h": 4}]}',
                       encoding="utf-8")
     check("v1 老文件照常读入（text 为空串）", RoiStore().get(path) == [Roi(1, 2, 3, 4, "")],
           str(RoiStore().get(path)))
+
+    # v2 老文件（有 text、没有 index）同样读得进来，排序号交给上层重编
+    legacy.write_text(
+        '{"version": 2, "annotations": [{"x": 1, "y": 2, "w": 3, "h": 4, "text": "旧"}]}',
+        encoding="utf-8",
+    )
+    check("v2 老文件照常读入（没有排序号）",
+          RoiStore().get(path) == [Roi(1, 2, 3, 4, "旧")], str(RoiStore().get(path)))
 
 
 def test_roi_interaction(window: MainWindow, root: Path) -> None:
@@ -562,6 +591,14 @@ def _double_click(widget, pos: QPoint) -> None:
     )
 
 
+def _click(widget, pos: QPoint) -> None:
+    """往 widget 送一次完整的左键点击（按下 + 松开）。"""
+    _send_mouse(widget, QEvent.Type.MouseButtonPress, pos,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+    _send_mouse(widget, QEvent.Type.MouseButtonRelease, pos,
+                Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton)
+
+
 def test_text_edit(window: MainWindow, root: Path) -> None:
     """双击图元 / 双击结果面板都能改 ROI 的 text 字段，并且立刻落盘。"""
     paths = [p for p in collect_images(root) if p.name != "broken.png"]
@@ -675,6 +712,17 @@ def test_text_edit(window: MainWindow, root: Path) -> None:
     QApplication.processEvents()
     check("面板编辑中重填不崩溃", window._panel.rowCount() == view.roi_count(),
           f"{window._panel.rowCount()} vs {view.roi_count()}")
+
+    # ---- 进入排序模式会先收下正在就地编辑的文本（跟画布上按下左键一个道理）
+    view.set_rois([Roi(20, 20, 60, 30, "排序前")])
+    _double_click(viewport, center_of(0))
+    check("排序前先打开编辑器", view.is_editing_text())
+    view._text_editor.setPlainText("排序前敲的字")
+    window.act_sort_rois.trigger()
+    check("进入排序模式会先收下正在编辑的文本",
+          not view.is_editing_text() and view.rois()[0].text == "排序前敲的字",
+          str(view.rois()))
+    QTest.keyClick(view, Qt.Key.Key_Escape)  # 退出排序模式，别留给别的测试
 
     view.clear_rois()  # 别把标注留给后面的 OCR 测试
 
@@ -933,6 +981,172 @@ def test_text_box_font(window: MainWindow, root: Path) -> None:
     view.clear_rois()
 
 
+def test_roi_order(window: MainWindow, root: Path) -> None:
+    """ROI 排序号：初始是创建顺序，排序模式按点击顺序重排，并且随标注一起落盘。"""
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    view = window.view
+    viewport = view.viewport()
+
+    def order_of(text: str) -> int:
+        return next(item.order() for item in view.roi_items() if item.text() == text)
+
+    def point_of(text: str) -> QPoint:
+        item = next(item for item in view.roi_items() if item.text() == text)
+        return view.mapFromScene(item.mapRectToScene(item.rect()).center())
+
+    # ---- 初始顺序 = 创建（读入）顺序，不是坐标顺序
+    # 故意让坐标顺序与创建顺序相反：先建的在右边，后建的在左上
+    view.set_rois([Roi(120, 40, 50, 25, "右边"), Roi(10, 10, 40, 20, "左边")])
+    view.fit_to_window()
+    QApplication.processEvents()
+    check("初始顺序就是创建顺序，不按坐标重排",
+          [roi.text for roi in view.rois()] == ["右边", "左边"]
+          and [roi.index for roi in view.rois()] == [1, 2],
+          str(view.rois()))
+    check("面板第一列显示排序号",
+          window._panel.item(0, 0).text() == "1"
+          and window._panel.item(1, 0).text() == "2",
+          f"{window._panel.item(0, 0).text()}/{window._panel.item(1, 0).text()}")
+    check("面板行序跟着排序号",
+          window._panel.item(0, 2).text() == "右边"
+          and window._panel.item(1, 2).text() == "左边",
+          f"{window._panel.item(0, 2).text()}/{window._panel.item(1, 2).text()}")
+
+    # ---- 新画的框排在最后
+    start = view.mapFromScene(QPointF(10, 75))
+    drag(viewport, start, QPoint(start.x() + 40, start.y() + 30))
+    check("新画的框排在最后",
+          view.roi_count() == 3 and view.rois()[2].index == 3, str(view.rois()))
+
+    # ---- 删掉中间那个之后序号重排，不留空档
+    view.select_roi_item(view.roi_items()[1], center=False)
+    window.act_delete_roi.trigger()
+    check("删除后序号重排成连续的 1..N",
+          [roi.index for roi in view.rois()] == [1, 2], str(view.rois()))
+
+    # ---- 排序模式：按点击顺序从 1 开始编号
+    view.set_rois([Roi(10, 10, 40, 20, "A"), Roi(120, 10, 40, 20, "B"),
+                   Roi(10, 60, 40, 20, "C")])
+    view.fit_to_window()
+    QApplication.processEvents()
+    check("Ctrl+Shift+S 绑定到排序模式",
+          "Ctrl+Shift+S" in _shortcut_texts(window.act_sort_rois),
+          str(_shortcut_texts(window.act_sort_rois)))
+
+    window.act_sort_rois.trigger()
+    check("进入排序模式（菜单 / 快捷键同一个动作）",
+          view.sort_mode and window.act_sort_rois.isChecked())
+    check("排序模式下每个框都露出角标",
+          all(item.order_badge().isVisible() for item in view.roi_items()))
+    check("进入时都还没点到（角标是 ?）",
+          all(item.order_badge().is_pending() for item in view.roi_items()))
+    check("排序模式下指针是十字",
+          viewport.cursor().shape() == Qt.CursorShape.CrossCursor,
+          str(viewport.cursor().shape()))
+
+    _click(viewport, point_of("C"))
+    check("第一个点的是 1", order_of("C") == 1, f"C={order_of('C')}")
+    check("点过的框角标不再是 ?",
+          not next(i for i in view.roi_items()
+                   if i.text() == "C").order_badge().is_pending())
+    check("状态栏报告编号进度", "已编号 1/3" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+    check("结果面板跟着重排",
+          window._panel.item(0, 2).text() == "C", window._panel.item(0, 2).text())
+
+    _click(viewport, point_of("B"))
+    _click(viewport, point_of("A"))
+    check("按点击顺序排成 1、2、3",
+          [item.text() for item in view.roi_items()] == ["C", "B", "A"],
+          str([item.text() for item in view.roi_items()]))
+    check("排序号与点击顺序一致",
+          (order_of("C"), order_of("B"), order_of("A")) == (1, 2, 3),
+          f"{order_of('C')},{order_of('B')},{order_of('A')}")
+
+    # ---- 重复点已编号的框：不改动顺序，只说明一下
+    _click(viewport, point_of("C"))
+    check("重复点已编号的框不改动顺序",
+          (order_of("C"), order_of("B"), order_of("A")) == (1, 2, 3),
+          f"{order_of('C')},{order_of('B')},{order_of('A')}")
+    check("重复点击时状态栏说明原因",
+          "已经排在第 1 位" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+    check("排序模式下的点击不选中框",
+          not any(item.isSelected() for item in view.roi_items()))
+
+    # ---- 空白处点击 / 拖动都不会新建或移动图元
+    _click(viewport, view.mapFromScene(QPointF(180, 90)))
+    check("点空白处不新建标注", view.roi_count() == 3, str(view.roi_count()))
+
+    before = next(item for item in view.roi_items() if item.text() == "B").to_roi()
+    grip = point_of("B")
+    drag(viewport, grip, QPoint(grip.x() + 40, grip.y() + 20))
+    after = next(item for item in view.roi_items() if item.text() == "B").to_roi()
+    check("排序模式下拖不动图元",
+          abs(after.x - before.x) < 1e-6 and abs(after.y - before.y) < 1e-6,
+          f"{before} -> {after}")
+
+    # ---- 双击也不进文本编辑（这个模式下左键只用来编号）
+    _double_click(viewport, point_of("A"))
+    check("排序模式下双击不进文本编辑", not view.is_editing_text())
+
+    # ---- 每点一次就落盘，不用等切图
+    stored = RoiStore().get(paths[0])
+    check("排序结果立刻写进边车文件",
+          [roi.text for roi in stored] == ["C", "B", "A"]
+          and [roi.index for roi in stored] == [1, 2, 3],
+          str(stored))
+
+    # ---- Esc 退出：角标收起、指针恢复
+    QTest.keyClick(view, Qt.Key.Key_Escape)
+    check("Esc 退出排序模式",
+          not view.sort_mode and not window.act_sort_rois.isChecked())
+    check("退出后角标收起来",
+          not any(item.order_badge().isVisible() for item in view.roi_items()))
+    check("退出后指针恢复默认",
+          viewport.cursor().shape() == Qt.CursorShape.ArrowCursor,
+          str(viewport.cursor().shape()))
+
+    # ---- 没点到的框跟在后面，保持原有相对次序
+    view.set_rois([Roi(10, 10, 40, 20, "A"), Roi(70, 10, 40, 20, "B"),
+                   Roi(130, 10, 40, 20, "C"), Roi(10, 60, 40, 20, "D")])
+    view.fit_to_window()
+    QApplication.processEvents()
+    window.act_sort_rois.trigger()
+    _click(viewport, point_of("C"))
+    QTest.keyClick(view, Qt.Key.Key_Escape)  # 只点一个就退出
+    check("没点到的框按原顺序接在后面",
+          [item.text() for item in view.roi_items()] == ["C", "A", "B", "D"],
+          str([item.text() for item in view.roi_items()]))
+
+    # ---- 重新进入是从头排，不沿用上次的"已点"状态
+    QTest.keyClick(window, Qt.Key.Key_S,
+                   Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    check("Ctrl+Shift+S 能真正进入排序模式", view.sort_mode)
+    check("重新进入时又都回到未点状态",
+          all(item.order_badge().is_pending() for item in view.roi_items()))
+    _click(viewport, point_of("D"))
+    check("重新排的第一个又是 1", order_of("D") == 1, f"D={order_of('D')}")
+
+    # ---- 排序模式只作用于单张图：切图自动退出，切回来顺序还在
+    window.show_next()
+    check("切图会自动退出排序模式",
+          not view.sort_mode and not window.act_sort_rois.isChecked())
+    check("新的一张没有角标残留",
+          not any(item.order_badge().isVisible() for item in view.roi_items()))
+    window.show_prev()
+    check("切回来顺序还在",
+          [item.text() for item in view.roi_items()] == ["D", "C", "A", "B"],
+          str([item.text() for item in view.roi_items()]))
+
+    view.clear_rois()  # 别把标注留给后面的 OCR 测试
+
+
 def _fake_manga_ocr_run(image: QImage) -> tuple[str, dict]:
     """用假的 ``manga_ocr`` 模块走一遍 :class:`MangaOcrEngine`，验证接线。
 
@@ -1046,7 +1260,7 @@ def test_ocr_workflow(window: MainWindow, root: Path, engine: FakeOcrEngine) -> 
           json.dumps(raw, ensure_ascii=False))
     check("没识别的标注仍不写 text 字段", "text" not in raw["annotations"][0],
           json.dumps(raw["annotations"][0], ensure_ascii=False))
-    check("边车文件版本为 2", raw["version"] == 2, str(raw["version"]))
+    check("边车文件版本为 3", raw["version"] == 3, str(raw["version"]))
 
     # ---- 识别全部
     window.act_ocr_all.trigger()
@@ -1192,6 +1406,7 @@ def main() -> int:
         test_text_edit(window, root)
         test_text_box(window, root)
         test_text_box_font(window, root)
+        test_roi_order(window, root)
         test_ocr_workflow(window, root, engine)
         test_ocr_cancel(window, root, engine)
         test_ocr_merge(window, root)

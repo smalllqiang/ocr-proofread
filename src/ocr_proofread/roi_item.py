@@ -8,6 +8,9 @@
 自己被选中时出现，显示这个框的识别文本；它是本图元的子图元，所以跟着标注一起
 移动、缩放、删除，不需要额外的簿记。
 
+图元左上角还有一个排序角标（:class:`OrderBadge`），只在 ROI 排序模式下露出来，
+显示这个框在本张图上的序号；同样是子图元，跟着标注走。
+
 坐标约定见 :mod:`ocr_proofread.image_view`：场景单位 = 图像像素，原点在图像左上角。
 图元只用平移（不改 ``pos`` 之外的变换），所以 :meth:`RoiItem.to_roi` 可以直接
 ``mapRectToScene`` 得到图像坐标。
@@ -18,7 +21,7 @@ from __future__ import annotations
 from enum import Enum
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QPen
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsRectItem
 
 from .annotations import Roi
@@ -32,6 +35,9 @@ from .text_box import (
 #: 手柄的屏幕边长（像素），不随缩放变化
 HANDLE_SIZE = 9.0
 
+#: 排序角标的屏幕边长（像素，不随缩放变化）
+ORDER_BADGE_SIZE = 20.0
+
 #: 矩形的最小边长（图像像素），避免被拖成一条线
 MIN_SIZE = 3.0
 
@@ -40,6 +46,11 @@ _EDGE_COLOR_HOVER = QColor("#42a5f5")
 _EDGE_COLOR_SELECTED = QColor("#ff6d00")
 _FILL_COLOR = QColor(30, 136, 229, 38)
 _HANDLE_COLOR = QColor("#ffffff")
+
+# 排序角标：已经点到过的用橙色，本次还没点到的用灰色问号
+_BADGE_COLOR_PICKED = QColor("#ff6d00")
+_BADGE_COLOR_PENDING = QColor("#9e9e9e")
+_BADGE_TEXT_COLOR = QColor("#ffffff")
 
 
 class HandleRole(Enum):
@@ -138,6 +149,68 @@ class RoiHandle(QGraphicsRectItem):
         event.accept()
 
 
+class OrderBadge(QGraphicsItem):
+    """标注左上角的排序角标：排序模式下显示这个框在本张图上的序号。
+
+    和文本框一样带 ``ItemIgnoresTransformations``：位置锚在标注的左上角（父坐标，
+    图像像素），自身按屏幕像素绘制，所以画布缩放到 2% 或 4000%，角标看上去都一样大。
+    ``pending`` 表示本次排序还没点到这个框，画成灰色的「?」，好一眼看出还剩几个。
+    """
+
+    def __init__(self, parent: QGraphicsItem) -> None:
+        super().__init__(parent)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setZValue(4.0)  # 压在文本框与手柄上面
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)  # 不抢画布的鼠标操作
+        self._font = QFont()
+        self._font.setBold(True)
+        self._number = 1
+        self._pending = False
+        self.setVisible(False)  # 只有排序模式下才露出来
+
+    def number(self) -> int:
+        """当前显示的序号（从 1 开始）。"""
+        return self._number
+
+    def set_number(self, number: int) -> None:
+        number = max(int(number), 1)
+        if number == self._number:
+            return
+        self._number = number
+        self.update()
+
+    def is_pending(self) -> bool:
+        """本次排序还没点到这个框吗。"""
+        return self._pending
+
+    def set_pending(self, pending: bool) -> None:
+        if pending == self._pending:
+            return
+        self._pending = pending
+        self.update()
+
+    def label(self) -> str:
+        """画出来的字：还没点到是「?」，否则是序号。"""
+        return "?" if self._pending else str(self._number)
+
+    def boundingRect(self) -> QRectF:  # noqa: N802 (Qt 命名)
+        return QRectF(0.0, 0.0, ORDER_BADGE_SIZE, ORDER_BADGE_SIZE)
+
+    def paint(self, painter, option, widget=None) -> None:  # noqa: N802
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.boundingRect()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(
+            QBrush(_BADGE_COLOR_PENDING if self._pending else _BADGE_COLOR_PICKED)
+        )
+        painter.drawRoundedRect(rect, 4.0, 4.0)
+        painter.setPen(QPen(_BADGE_TEXT_COLOR))
+        painter.setFont(self._font)
+        painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), self.label())
+        painter.restore()
+
+
 class RoiItem(QGraphicsRectItem):
     """场景里一个可交互的矩形 ROI。
 
@@ -146,6 +219,9 @@ class RoiItem(QGraphicsRectItem):
 
     图元还挂着一份 OCR 文本（:meth:`text` / :meth:`set_text`），随 :meth:`to_roi`
     一起交给上层落盘；它不参与几何运算，只是"识别结果跟着这个框走"。
+
+    ``order`` 是这个框在本张图上的序号（1、2、3…），由上层维护：新建的排最后，
+    读盘时按文件里的 ``index`` 排，排序模式下按点击顺序重排。
     """
 
     def __init__(
@@ -156,12 +232,14 @@ class RoiItem(QGraphicsRectItem):
         text: str = "",
         text_direction: TextDirection = DEFAULT_TEXT_DIRECTION,
         text_font_size: float = DEFAULT_FONT_SIZE,
+        order: int = 0,
         parent: QGraphicsItem | None = None,
     ) -> None:
         super().__init__(QRectF(rect).normalized(), parent)
         self._bounds = QRectF(bounds) if bounds is not None else None
         self._hovered = False
         self._text = text
+        self._order = max(int(order), 0)
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
@@ -178,16 +256,39 @@ class RoiItem(QGraphicsRectItem):
         self._text_box.set_text(text)
         self._text_box.setVisible(False)  # 只有被选中的标注才露出来
         self._text_box_after: bool | None = None  # 视图给的贴边方向；None = 按兜底规则
+        self._order_badge = OrderBadge(self)
+        self._order_badge.set_number(self._order)
         self._handles = [RoiHandle(self, role) for role in HandleRole]
         self.set_handles_visible(False)
         self._sync_handles()
         self._sync_text_box_anchor()
+        self._sync_order_badge()
 
     # ------------------------------------------------------------------ 数据
 
     def to_roi(self) -> Roi:
-        """当前几何（含 ``pos`` 偏移）与 OCR 文本转成图像坐标的 :class:`Roi`。"""
-        return Roi.from_rect(self.mapRectToScene(self.rect()), self._text)
+        """当前几何（含 ``pos`` 偏移）、OCR 文本与序号转成图像坐标的 :class:`Roi`。"""
+        return Roi.from_rect(self.mapRectToScene(self.rect()), self._text, self._order)
+
+    def order(self) -> int:
+        """这个框在本张图上的序号（1、2、3…）；0 表示还没排过号。"""
+        return self._order
+
+    def set_order(self, order: int) -> None:
+        """改序号（同时刷新左上角的角标）。"""
+        self._order = max(int(order), 0)
+        self._order_badge.set_number(self._order)
+        self._apply_tooltip()
+
+    def order_badge(self) -> OrderBadge:
+        """左上角那个只在排序模式下露出来的序号角标。"""
+        return self._order_badge
+
+    def set_order_badge(self, *, visible: bool, pending: bool) -> None:
+        """排序模式下的角标状态：是否显示，以及本次是不是还没被点到。"""
+        self._order_badge.set_number(self._order)
+        self._order_badge.set_pending(pending)
+        self._order_badge.setVisible(visible)
 
     def text(self) -> str:
         """这个 ROI 最近一次的 OCR 结果；空串表示还没识别过。"""
@@ -257,7 +358,7 @@ class RoiItem(QGraphicsRectItem):
     # ------------------------------------------------------------------ 交互
 
     def setRect(self, rect: QRectF) -> None:  # noqa: N802 (Qt 命名)
-        """改几何时把手柄与文本框一起挪过去。
+        """改几何时把手柄、文本框与排序角标一起挪过去。
 
         ``QGraphicsRectItem.setRect()`` 不会通知子图元，直接调它会让手柄和文本框
         留在旧位置（画新框时最明显），所以这里统一补一次同步。
@@ -265,6 +366,7 @@ class RoiItem(QGraphicsRectItem):
         super().setRect(QRectF(rect).normalized())
         self._sync_handles()
         self._sync_text_box_anchor()
+        self._sync_order_badge()
 
     def resize_by(self, role: HandleRole, delta: QPointF, start_rect: QRectF) -> None:
         """按手柄拖动量算出新矩形。
@@ -356,9 +458,19 @@ class RoiItem(QGraphicsRectItem):
             return center_x <= self._bounds.center().x()
         return True
 
+    def _sync_order_badge(self) -> None:
+        """把排序角标摆在标注的左上角（角标自己按屏幕像素画）。"""
+        self._order_badge.setPos(self.rect().topLeft())
+
     def _apply_tooltip(self) -> None:
         hint = "拖动移动，拖动方块手柄缩放，双击编辑文本，Delete 删除"
-        self.setToolTip(f"{self._text}\n\n{hint}" if self._text else hint)
+        lines = []
+        if self._order > 0:
+            lines.append(f"排序 #{self._order}")
+        if self._text:
+            lines.append(self._text)
+        lines.append(hint)
+        self.setToolTip("\n\n".join(lines))
 
     def _apply_pen(self) -> None:
         if self.isSelected():

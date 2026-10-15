@@ -1,4 +1,4 @@
-"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、ROI 标注、OCR、状态持久化。
+"""主窗口：打开图像 / 文件夹、切换上一张下一张、缩放、ROI 标注与排序、OCR、状态持久化。
 
 ROI 图元的挂载点与生命周期约定见 :mod:`ocr_proofread.image_view`；
 "每张图一份标注"的存取见 :mod:`ocr_proofread.annotations`；
@@ -271,6 +271,13 @@ class MainWindow(QMainWindow):
             slot=self._clear_rois,
             tip="删除当前图像上的全部矩形标注",
         )
+        self.act_sort_rois = self._make_action(
+            "ROI 排序模式(&O)",
+            shortcuts=["Ctrl+Shift+S"],
+            slot=self._toggle_sort_rois,
+            tip="进入后按点击顺序给 ROI 编号（1、2、3…），Esc 退出",
+            checkable=True,
+        )
         self.act_save_rois = self._make_action(
             "保存标注(&S)",
             shortcuts=["Ctrl+S"],
@@ -330,6 +337,9 @@ class MainWindow(QMainWindow):
 
         self.view.roisChanged.connect(self._refresh_ocr_panel)
         self.view.roisChanged.connect(self._update_actions)
+        self.view.roiOrderChanged.connect(self._on_roi_order_changed)
+        self.view.sortModeChanged.connect(self._on_sort_mode_changed)
+        self.view.sortPicked.connect(self._on_sort_picked)
         self.view.roiTextChanged.connect(self._on_roi_text_changed)
         self.view.selectionChanged.connect(self._sync_panel_selection)
         self.view.selectionChanged.connect(self._update_actions)
@@ -375,6 +385,8 @@ class MainWindow(QMainWindow):
         menu_roi = bar.addMenu("标注(&R)")
         menu_roi.addAction(self.act_delete_roi)
         menu_roi.addAction(self.act_clear_rois)
+        menu_roi.addSeparator()
+        menu_roi.addAction(self.act_sort_rois)
         menu_roi.addSeparator()
         menu_roi.addAction(self.act_save_rois)
 
@@ -600,10 +612,50 @@ class MainWindow(QMainWindow):
 
         busy = self._ocr_job is not None
         items = self.view.roi_items() if has_image else []
+        self.act_sort_rois.setEnabled(bool(items))
         self.act_ocr_all.setEnabled(bool(items) and not busy)
         self.act_ocr_selected.setEnabled(
             any(item.isSelected() for item in items) and not busy
         )
+
+    # -------------------------------------------------------------- ROI 排序
+
+    def _toggle_sort_rois(self) -> None:
+        """Ctrl+Shift+S：进入 / 退出 ROI 排序模式（只作用于当前这张图）。"""
+        if self._current_path() is None:
+            self.act_sort_rois.setChecked(False)
+            self.statusBar().showMessage("还没有打开图像", 3000)
+            return
+        self.view.set_sort_mode(self.act_sort_rois.isChecked())
+
+    def _on_sort_mode_changed(self, enabled: bool) -> None:
+        """视图进出排序模式后，同步菜单勾选与状态栏提示。"""
+        self.act_sort_rois.setChecked(enabled)
+        if enabled:
+            count = self.view.roi_count()
+            self.statusBar().showMessage(
+                f"ROI 排序模式：按点击顺序给这 {count} 个标注编号（1、2、3…），Esc 退出",
+                8000,
+            )
+        else:
+            self.statusBar().showMessage("已退出 ROI 排序模式", 3000)
+        self._update_actions()
+
+    def _on_sort_picked(self, item: RoiItem, number: int) -> None:
+        """每点中一个标注就报一下进度；点到已经排过号的框时说明原因。"""
+        if number:
+            total = self.view.roi_count()
+            self.statusBar().showMessage(
+                f"已编号 {number}/{total}：这个标注排在第 {number} 位（Esc 退出排序模式）",
+                5000,
+            )
+        else:
+            self.statusBar().showMessage(f"这个标注已经排在第 {item.order()} 位", 3000)
+
+    def _on_roi_order_changed(self) -> None:
+        """顺序变了：结果面板跟着重排，并立刻写盘（排一次序不该等切图才保存）。"""
+        self._refresh_ocr_panel()
+        self._flush_rois()
 
     # -------------------------------------------------------------- 文本框排版
 
@@ -828,14 +880,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ OCR 结果面板
 
     def _refresh_ocr_panel(self) -> None:
-        """把当前图的 ROI 与识别文本重填进面板（顺序与场景里的 ROI 一致）。"""
+        """把当前图的 ROI 与识别文本重填进面板（顺序与场景里的 ROI 顺序一致）。"""
         self._panel_items = self.view.roi_items()
         self._panel.blockSignals(True)  # 重填过程中不要触发"点行选中图元"
         try:
             self._panel.setRowCount(len(self._panel_items))
             for row, item in enumerate(self._panel_items):
                 roi = item.to_roi()
-                self._panel.setItem(row, 0, _table_cell(str(row + 1)))
+                # 第一列显示这个框在本张图上的顺序（排序模式排的就是它），行号只是位置
+                self._panel.setItem(row, 0, _table_cell(str(item.order())))
                 self._panel.setItem(
                     row,
                     1,
@@ -970,7 +1023,10 @@ class MainWindow(QMainWindow):
             "                                        （Esc 放弃，Ctrl+Enter 或点开别处采纳）\n"
             "  Delete                              删除选中的标注\n"
             "  Ctrl+S                              保存当前图的标注\n"
-            "  Esc                                 放弃正在拉的矩形 / 取消选中\n"
+            "  Ctrl+Shift+S                        进入 / 退出 ROI 排序模式\n"
+            "                                        进入后按点击顺序给 ROI 编号 1、2、3…\n"
+            "                                        只作用于当前这张图，Esc 退出\n"
+            "  Esc                                 放弃正在拉的矩形 / 取消选中 / 退出排序模式\n"
             "  选中标注时，旁边的小框显示这个框的识别文本\n"
             "    横排贴上下、竖排贴左右；光标放在框上滚滚轮可以调字号\n"
             "  「视图 → 文本框排版方向」切换横排 / 竖排（记进设置）\n"

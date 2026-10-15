@@ -8,8 +8,6 @@ OCR 校对 / 图像 ROI 标注工具（PySide6 + QGraphicsView）。
 左键拖出矩形并调整、每张图的标注与识别结果随图切换自动保存与恢复。识别文本的编辑、
 校对与导出不在范围内。
 
-![界面预览](docs/preview.png)
-
 ## 文档
 
 - [docs/architecture.md](docs/architecture.md) —— 模块职责、主流程、依赖取舍、扩展约定。

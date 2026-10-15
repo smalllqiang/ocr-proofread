@@ -109,8 +109,7 @@ MainWindow._finalize_ocr()      写回 RoiItem → _flush_rois() 落盘 → 刷�
 ├── uv.lock                     # 锁定的依赖版本
 ├── .python-version             # 固定 Python 版本
 ├── docs/
-│   ├── architecture.md         # 本文件
-│   └── preview.png             # 界面预览图
+│   └── architecture.md         # 本文件
 ├── src/ocr_proofread/
 │   ├── __init__.py             # main() 入口
 │   ├── __main__.py             # python -m ocr_proofread

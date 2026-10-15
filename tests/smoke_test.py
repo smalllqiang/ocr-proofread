@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -27,7 +28,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QImage, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
-from PySide6.QtWidgets import QAbstractItemView, QApplication, QLineEdit  # noqa: E402
+from PySide6.QtWidgets import (  # noqa: E402
+    QAbstractItemView,
+    QApplication,
+    QFileDialog,
+    QLineEdit,
+    QMessageBox,
+)
 
 from ocr_proofread.annotations import (  # noqa: E402
     Roi,
@@ -35,6 +42,12 @@ from ocr_proofread.annotations import (  # noqa: E402
     sidecar_path,
 )
 from ocr_proofread.app import MainWindow  # noqa: E402
+from ocr_proofread.export import (  # noqa: E402
+    EXPORT_SUFFIX,
+    build_text,
+    default_export_path,
+    write_export,
+)
 from ocr_proofread.image_view import MAX_SCALE, MIN_SCALE  # noqa: E402
 from ocr_proofread.images import collect_images, load_qimage, natural_key  # noqa: E402
 from ocr_proofread.ocr import (  # noqa: E402
@@ -1147,6 +1160,165 @@ def test_roi_order(window: MainWindow, root: Path) -> None:
     view.clear_rois()  # 别把标注留给后面的 OCR 测试
 
 
+class _FakeSaveDialog:
+    """临时替换 ``QFileDialog.getSaveFileName``，让导出测试不用真的弹窗。
+
+    记下每次调用传进来的（起始路径, 过滤器），好在不弹窗的前提下断言"默认建议了
+    哪个文件名"；退出时把原方法放回去。
+    """
+
+    def __init__(self, result: tuple[str, str]) -> None:
+        self.result = result
+        self.calls: list[tuple[str, ...]] = []
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = QFileDialog.getSaveFileName
+
+        def fake(_parent, _caption, directory="", name_filter="", *args, **kwargs):
+            self.calls.append((str(directory), str(name_filter)))
+            return self.result
+
+        QFileDialog.getSaveFileName = fake
+        return self
+
+    def __exit__(self, *exc) -> None:
+        QFileDialog.getSaveFileName = self._saved
+
+
+class _FakeWarning:
+    """临时替换 ``QMessageBox.warning``，把弹窗内容收下来而不是真弹出来。"""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = QMessageBox.warning
+        QMessageBox.warning = lambda *args, **kwargs: self.messages.append(
+            str(args[2]) if len(args) > 2 else ""
+        )
+        return self
+
+    def __exit__(self, *exc) -> None:
+        QMessageBox.warning = self._saved
+
+
+def test_export(window: MainWindow, root: Path) -> None:
+    """导出文本：格式、图像与 ROI 顺序、跳空图，以及默认路径 / 选路径两条路。"""
+    # ---- 纯函数：导出格式与默认路径
+    pages = [("p1.png", ["第一行", ""]), ("p2.png", ["  空白  "])]
+    check("导出格式：文件名一段、每个 ROI 文本一段，各自空一行",
+          build_text(pages) == "p1.png\n\n第一行\n\n\n\np2.png\n\n  空白  \n\n",
+          repr(build_text(pages)))
+    check("多行文本原样输出",
+          build_text([("a.png", ["上\n下"])]) == "a.png\n\n上\n下\n\n",
+          repr(build_text([("a.png", ["上\n下"])])))
+    check("一张图都没有时导出内容为空", build_text([]) == "")
+    check("默认导出路径是文件夹里的 <文件夹名>.txt",
+          default_export_path(root) == root / f"{root.name}{EXPORT_SUFFIX}",
+          str(default_export_path(root)))
+
+    # ---- 写盘：内容与失败处理
+    written = root / "sub" / "written.txt"
+    write_export(written, "内容\n")
+    check("write_export 按 UTF-8 写盘",
+          written.read_text(encoding="utf-8") == "内容\n")
+    try:
+        write_export(root / "sub", "x")  # 目标是目录，写不进去
+    except OSError:
+        check("写盘失败会抛 OSError", True)
+    else:
+        check("写盘失败会抛 OSError", False, "没有抛异常")
+    check("写盘失败不留临时文件", not (root / "sub.tmp").exists())
+
+    # ---- 窗口：图像顺序 + ROI 顺序，没有 ROI 的图整张跳过
+    paths = [p for p in collect_images(root) if p.name != "broken.png"]
+    window.open_paths(paths)
+    window.resize(900, 700)
+    window.show()
+    QTest.qWaitForWindowExposed(window)
+
+    view = window.view
+    view.set_rois([Roi(10, 10, 40, 20, "一之文本", 1), Roi(60, 10, 40, 20, "", 2)])
+    window.act_save_rois.trigger()
+    window.show_next()  # img2.png：没有 ROI
+    window.show_next()  # img10.png
+    view.set_rois([Roi(10, 10, 40, 20, "三之文本", 1)])
+    window.act_save_rois.trigger()
+    window.show_next()  # photo.JPG：没有 ROI
+    check("导出前停在最后一张", window._current_path().name == "photo.JPG",
+          window._current_path().name)
+    check("「导出文本」绑定了快捷键",
+          "Ctrl+E" in _shortcut_texts(window.act_export_text),
+          str(_shortcut_texts(window.act_export_text)))
+
+    window.act_export_text.trigger()
+    target = root / f"{root.name}{EXPORT_SUFFIX}"
+    check("「导出文本」落在图像文件夹里", target.is_file(), str(target))
+    check("导出内容按图像顺序与 ROI 顺序，并跳过没有 ROI 的图",
+          target.read_text(encoding="utf-8")
+          == "img1.png\n\n一之文本\n\n\n\nimg10.png\n\n三之文本\n\n",
+          repr(target.read_text(encoding="utf-8")))
+    check("状态栏报告导出的图数与标注数",
+          "已导出 2 张图、3 个标注" in window.statusBar().currentMessage(),
+          window.statusBar().currentMessage())
+
+    # ---- 当前图还没落盘的改动，导出前会先写回
+    window.show_first()
+    view.roi_items()[0].set_text("改后的一之文本")
+    window.act_export_text.trigger()
+    check("导出前会先收下当前图没落盘的改动",
+          "改后的一之文本" in target.read_text(encoding="utf-8"),
+          repr(target.read_text(encoding="utf-8")))
+
+    # ---- 「导出文本到」：走保存对话框，只填文件名时补 .txt
+    chosen = root / "sub" / "chosen"
+    with _FakeSaveDialog((str(chosen), "")) as dialog:
+        window.act_export_text_as.trigger()
+    check("「导出文本到」按选择的路径写盘", chosen.with_suffix(".txt").is_file(),
+          str(chosen.with_suffix(".txt")))
+    check("只填文件名时补上 .txt",
+          chosen.with_suffix(".txt").read_text(encoding="utf-8")
+          == target.read_text(encoding="utf-8"))
+    check("保存对话框默认建议 <文件夹名>.txt 与文件夹位置",
+          bool(dialog.calls)
+          and dialog.calls[0][0] == str(root / f"{root.name}{EXPORT_SUFFIX}"),
+          str(dialog.calls))
+
+    # ---- 用户没选：直接退回应用，不作提示
+    message_before = window.statusBar().currentMessage()
+    with _FakeSaveDialog(("", "")) as dialog:
+        window.act_export_text_as.trigger()
+    check("取消选择时直接退回、不弹提示也不改状态栏",
+          len(dialog.calls) == 1
+          and window.statusBar().currentMessage() == message_before,
+          f"{dialog.calls} / {window.statusBar().currentMessage()}")
+
+    # ---- 默认路径不可用（没有打开图像 / 文件夹被删掉）：弹出错误
+    with _FakeWarning() as warning:
+        window._close_image()
+        check("关掉图像后默认导出目录不可用", window._export_folder() is None)
+        window._export_text()
+    check("没有打开图像时导出会报错",
+          bool(warning.messages) and "还没有打开图像" in warning.messages[0],
+          str(warning.messages))
+
+    gone = root / "gone"
+    gone.mkdir()
+    make_image(gone / "page.png", 60, 40, "#445566")
+    window.open_paths([gone / "page.png"])
+    shutil.rmtree(gone)  # 打开之后文件夹没了：默认路径失效
+    with _FakeWarning() as warning:
+        check("文件夹不在了时默认导出目录不可用", window._export_folder() is None)
+        window._export_text()
+    check("图像文件夹不在了也会报错",
+          bool(warning.messages) and "找不到图像所在的文件夹" in warning.messages[0],
+          str(warning.messages))
+
+    window._close_image()  # 别把这份状态留给后面的测试
+
+
 def _fake_manga_ocr_run(image: QImage) -> tuple[str, dict]:
     """用假的 ``manga_ocr`` 模块走一遍 :class:`MangaOcrEngine`，验证接线。
 
@@ -1407,6 +1579,7 @@ def main() -> int:
         test_text_box(window, root)
         test_text_box_font(window, root)
         test_roi_order(window, root)
+        test_export(window, root)
         test_ocr_workflow(window, root, engine)
         test_ocr_cancel(window, root, engine)
         test_ocr_merge(window, root)

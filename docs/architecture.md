@@ -5,11 +5,12 @@
 
 ## 设计边界
 
-当前版本做"浏览 + 框选 + 每图标注存取 + ROI 排序 + OCR 识别 + 文本编辑"：打开图像、缩放平移、
-上下张切换、左键拖出矩形并调整、切图时自动保存与恢复标注，对选中的或全部的 ROI 跑识别、
-把文本挂在对应的 ROI 上一起落盘，选中标注时在它旁边显示这段文本（横排 / 竖排可切），
-并且可以双击就地改掉它。每个 ROI 还有一个"本张图上的顺序号"，默认是创建顺序，也可以在
-排序模式里按点击顺序重排。批量替换、逐字校对与导出等更完整的校对工作流不在范围内。
+当前版本做"浏览 + 框选 + 每图标注存取 + ROI 排序 + OCR 识别 + 文本编辑 + 导出文本"：
+打开图像、缩放平移、上下张切换、左键拖出矩形并调整、切图时自动保存与恢复标注，对选中的
+或全部的 ROI 跑识别、把文本挂在对应的 ROI 上一起落盘，选中标注时在它旁边显示这段文本
+（横排 / 竖排可切），并且可以双击就地改掉它。每个 ROI 还有一个"本张图上的顺序号"，默认是
+创建顺序，也可以在排序模式里按点击顺序重排；最后可以把已打开图像的全部 ROI 文本导成一个
+纯文本文件。批量替换、逐字校对等更完整的校对工作流不在范围内。
 
 由此定下两条贯穿全项目的原则：
 
@@ -144,6 +145,40 @@ to_roi() ──▶ Roi.index ──▶ <图像文件名>.roi.json 的 "index" �
   显示，所以"哪个已经排到第几号"不用看右侧面板。它不接受鼠标按键，但 `_roi_at()` 仍然把
   它上溯到父图元，点角标等于点这个框。
 
+## 导出文本
+
+导出把**已打开**的这批图像的全部 ROI 文本拼成一个 `.txt`。分工是"选哪些内容"归
+`MainWindow`、"怎么拼、怎么写"归 `export.py`：
+
+```
+Ctrl+E / Ctrl+Shift+E
+        │  界面线程：确定导出路径
+        ▼
+MainWindow._export_to()     _flush_rois()（先把当前图的改动写回）
+        │
+        ├─ _export_pages()  按 self._paths 的顺序取 RoiStore 里的标注，没有 ROI 的图跳过
+        ▼
+export.build_text() 拼字符串 ──▶ export.write_export() 原子替换写盘
+```
+
+- **导出位置**：`Ctrl+E` 用 `default_export_path(第一个图像的文件夹)`，也就是
+  `<文件夹>/<文件夹名>.txt`——打开文件夹时就是这个文件夹，导入若干图像时是第一个图像
+  所在的那个。文件夹不存在（或压根没打开图像）时 `_export_folder()` 返回 `None`，
+  由 `_warn_export_unavailable()` 弹错误；`Ctrl+Shift+E` 走 `QFileDialog.getSaveFileName`
+  让用户自己选，用户取消（返回空串）就直接 `return`，不提示也不落盘。
+- **取哪些图**：只遍历 `self._paths`（工具里已打开的这批），不是重新扫描文件夹；
+  图像顺序就是浏览顺序。`_export_pages()` 用 `RoiStore.get()` 逐图取标注——没有边车文件
+  的图读出来就是空列表，和"有文件但没记录"一样被整张跳过，所以"连配置文件都没有"不需要
+  单独判断。
+- **顺序与内容**：`roi_items()` 已经按排序号排好，`RoiStore` 里的顺序就是它，因此 ROI 顺序
+  天然跟着排序模式的结果走；`build_text()` 只取 `roi.text`，空串照样输出成空行，不写
+  占位符、序号或坐标。
+- **写盘**：`write_export()` 与 `save_rois()` 一样"先写 `.tmp` 再 `os.replace`"，
+  半途失败不会留下半份导出结果，也不会把原文件写坏；IO 失败抛 `OSError`，由
+  `MainWindow` 转成错误弹窗。
+- **不含界面**：`export.py` 只用 `pathlib` 与 `os`，不 import 任何 Qt 模块，
+  可以在没有界面的场景下单独测试（`build_text()` 就是纯字符串函数）。
+
 ## 分层与模块职责
 
 ```
@@ -156,11 +191,12 @@ to_roi() ──▶ Roi.index ──▶ <图像文件名>.roi.json 的 "index" �
 ├── src/ocr_proofread/
 │   ├── __init__.py             # main() 入口
 │   ├── __main__.py             # python -m ocr_proofread
-│   ├── app.py                  # 主窗口：菜单、快捷键、打开/切换图像、标注存取、OCR 调度
+│   ├── app.py                  # 主窗口：菜单、快捷键、打开/切换图像、标注存取、OCR 调度、导出
 │   ├── image_view.py           # QGraphicsView 子类：显示、缩放、平移（中键 / 空格抓手）、左键框选
 │   ├── roi_item.py             # 场景里的矩形图元：选中、移动、八向手柄缩放、带识别文本
 │   ├── text_box.py             # 标注旁的文本小框：排版方向（横排 / 竖排）、尺寸与贴边
 │   ├── annotations.py          # Roi 数据结构 + RoiStore（内存缓存＋JSON 边车文件）
+│   ├── export.py               # 导出文本：拼格式、默认路径、原子写盘（无 Qt 依赖）
 │   ├── images.py               # 图像扫描、自然排序、读取（无界面依赖）
 │   └── ocr.py                  # OCR 引擎注册表、ROI 裁剪、后台识别任务（无控件依赖）
 └── tests/smoke_test.py         # 无界面冒烟测试
@@ -170,7 +206,9 @@ to_roi() ──▶ Roi.index ──▶ <图像文件名>.roi.json 的 "index" �
   菜单、快捷键、拖放、命令行参数最终都汇入 `open_paths()`。窗口大小、上次目录、上次用的
   识别模型、文本框排版方向与字号通过 `QSettings` 持久化；结果面板里双击改文本也在这里
   收口（`_on_panel_item_changed`），ROI 排序模式的菜单勾选、状态栏提示与"每点一次就落盘"
-  同样在这里接线（`_toggle_sort_rois()` / `_on_roi_order_changed()`）。
+  同样在这里接线（`_toggle_sort_rois()` / `_on_roi_order_changed()`）。导出的"用哪些图、
+  放哪里"也在这里决定（`_export_folder()` / `_export_pages()` / `_export_to()`），
+  拼字符串与写盘则交给 `export.py`。
 - **`image_view.py` / `ImageView`**：只负责当前这张图的变换（缩放、平移）、场景管理，
   "左键在图像空白处拉矩形"的交互，双击图元后的文本就地编辑（编辑器是视口的子控件，
   见 [扩展点与约定](#扩展点与约定)），文本框的排版方向、字号与每次重算，以及这张图上的
@@ -195,12 +233,16 @@ to_roi() ──▶ Roi.index ──▶ <图像文件名>.roi.json 的 "index" �
 - **`ocr.py`**：模型注册表（`OCR_MODELS` / `create_engine()`）、`crop_roi()` 裁剪、
   `QImage` → PIL 转换，以及跑在子线程里的 `OcrTask`。只用 QtCore / QtGui，不含控件，
   界面通过 `MainWindow(ocr_factory=...)` 注入引擎，测试里可以换成假引擎。
+- **`export.py`**：纯数据层，不含任何 Qt 依赖。`build_text()` 把"文件名 + 每个 ROI 文本"
+  拼成导出文本，`default_export_path()` 给出默认导出位置，`write_export()` 原子写盘。
+  可以在没有界面的场景下单独使用或测试。
 - **`__init__.py` / `__main__.py`**：命令入口，只做转发。
 
 依赖方向单向：`app.py` → `image_view.py` → `roi_item.py` → `text_box.py` →
 `annotations.py`，另有 `app.py` → `images.py`、`app.py` → `ocr.py`、
-`app.py` → `text_box.py`（只为了那个方向设定）。反向引用一律禁止，`annotations.py`、
-`images.py`、`ocr.py`、`text_box.py` 不依赖任何视图或窗口模块。
+`app.py` → `export.py`、`app.py` → `text_box.py`（只为了那个方向设定）。反向引用一律禁止，
+`annotations.py`、`export.py`、`images.py`、`ocr.py`、`text_box.py` 不依赖任何视图或
+窗口模块。
 
 ## 环境与依赖
 
@@ -295,6 +337,10 @@ ROI 图元直接挂到 `ImageView` 的场景上，以下约定必须遵守：
 - **加新 OCR 模型**：在 `ocr.py` 的 `OCR_MODELS` 里加一条 `OcrModel(name, label, factory)`，
   实现 `recognize(QImage) -> str`（失败抛 `OcrError`）即可，菜单与模型选择会自动出现这一项。
   引擎必须能"第一次调用时才加载"，且不要自己开线程——`OcrTask` 已经在子线程里调它。
+- **导出只读 `RoiStore`、不读场景**：`MainWindow._export_pages()` 遍历 `self._paths` 从存储层
+  取标注，当前这张图的内容先由 `_export_to()` 开头的 `_flush_rois()` 写回，所以导出的一定是
+  "已落盘 + 刚写回"的最新内容。要加别的导出格式（CSV、每图一个文件…）时沿用这个入口，
+  别去问 `ImageView` 要数据；拼格式与写盘放进 `export.py`，那里不允许 import Qt。
 - **线程边界**：`images.load_qimage()` 只产生 `QImage`，可以在 GUI 线程之外调用；`QPixmap`
   的转换集中在 `ImageView.set_image()`，始终在 GUI 线程。`OcrTask` 只碰 `QImage` 与纯数据，
   新增识别逻辑时请保持这条界线。
@@ -341,3 +387,10 @@ OCR 部分**不加载真模型**：`MainWindow(ocr_factory=...)` 注入 `FakeOcr
 覆盖裁剪尺寸与越界处理、模型注册表、`QImage` → PIL 接线（把假的 `manga_ocr` 模块塞进
 `sys.modules`，因此不需要 torch）、后台任务的完成与取消（识别中途切图）、识别结果写回
 图元与边车文件、面板与选中的双向同步，以及"迟到结果按几何并回磁盘"的兜底路径。
+
+导出的覆盖：`build_text()` 的格式（文件名与每个 ROI 各占一段、空文本与多行文本原样输出）、
+`default_export_path()`、写盘失败抛 `OSError` 且不留 `.tmp`；窗口侧覆盖按图像顺序与 ROI
+顺序导出、跳过没有 ROI 的图、导出前收下当前图还没落盘的改动、`Ctrl+Shift+E` 的保存对话框
+（用假对话框替换 `QFileDialog.getSaveFileName`，含"只填文件名时补 `.txt`"与"取消就退回、
+不作提示"），以及路径不可用（没有打开图像 / 文件夹被删掉）时的错误弹窗（同样用假的
+`QMessageBox.warning` 接住，不真弹窗）。

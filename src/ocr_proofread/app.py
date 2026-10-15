@@ -32,6 +32,13 @@ from PySide6.QtWidgets import (
 )
 
 from .annotations import RoiStore
+from .export import (
+    EXPORT_NAME_FILTER,
+    EXPORT_SUFFIX,
+    build_text,
+    default_export_path,
+    write_export,
+)
 from .image_view import ImageView
 from .images import IMAGE_NAME_FILTER, collect_images, is_image_file, load_qimage
 from .ocr import (
@@ -285,6 +292,19 @@ class MainWindow(QMainWindow):
             tip="把当前图像的标注写入图像旁边的 .roi.json 文件",
         )
 
+        self.act_export_text = self._make_action(
+            "导出文本(&T)",
+            shortcuts=["Ctrl+E"],
+            slot=self._export_text,
+            tip="把已打开图像的 ROI 文本导出到图像文件夹里的 <文件夹名>.txt",
+        )
+        self.act_export_text_as = self._make_action(
+            "导出文本到(&A)…",
+            shortcuts=["Ctrl+Shift+E"],
+            slot=self._export_text_as,
+            tip="选择导出文件的位置，内容与「导出文本」相同",
+        )
+
         self.act_ocr_selected = self._make_action(
             "识别选中标注(&S)",
             shortcuts=["Ctrl+R"],
@@ -389,6 +409,10 @@ class MainWindow(QMainWindow):
         menu_roi.addAction(self.act_sort_rois)
         menu_roi.addSeparator()
         menu_roi.addAction(self.act_save_rois)
+
+        menu_export = bar.addMenu("导出(&E)")
+        menu_export.addAction(self.act_export_text)
+        menu_export.addAction(self.act_export_text_as)
 
         menu_ocr = bar.addMenu("OCR(&O)")
         menu_ocr.addAction(self.act_ocr_selected)
@@ -609,6 +633,8 @@ class MainWindow(QMainWindow):
         self.act_delete_roi.setEnabled(has_image)
         self.act_clear_rois.setEnabled(has_image)
         self.act_save_rois.setEnabled(has_image)
+        self.act_export_text.setEnabled(has_image)
+        self.act_export_text_as.setEnabled(has_image)
 
         busy = self._ocr_job is not None
         items = self.view.roi_items() if has_image else []
@@ -656,6 +682,91 @@ class MainWindow(QMainWindow):
         """顺序变了：结果面板跟着重排，并立刻写盘（排一次序不该等切图才保存）。"""
         self._refresh_ocr_panel()
         self._flush_rois()
+
+    # ------------------------------------------------------------------ 导出
+
+    def _export_folder(self) -> Path | None:
+        """默认导出目录：当前这批图像所在的文件夹（来自不同文件夹时用第一个）。
+
+        打开文件夹时这批图都在这个文件夹里；导入若干图像时就是**第一个图像**所在
+        的文件夹。没有打开图像、或这个文件夹已经不在了，返回 ``None``。
+        """
+        if not self._paths:
+            return None
+        folder = self._paths[0].parent
+        return folder if folder.is_dir() else None
+
+    def _export_text(self) -> None:
+        """Ctrl+E：导出文本到图像文件夹里的 ``<文件夹名>.txt``，不弹保存对话框。"""
+        folder = self._export_folder()
+        if folder is None:
+            self._warn_export_unavailable()
+            return
+        self._export_to(default_export_path(folder))
+
+    def _export_text_as(self) -> None:
+        """Ctrl+Shift+E：先弹保存对话框；用户没选就退回，不作任何提示。"""
+        folder = self._export_folder()
+        if folder is None and not self._paths:
+            self._warn_export_unavailable()
+            return
+        if folder is not None:  # 文件夹还在：默认位置与文件名不变
+            start = default_export_path(folder)
+        else:  # 文件夹没了：退到上次用过的目录，文件名只能自己起一个
+            start = Path(self._start_dir()) / f"export{EXPORT_SUFFIX}"
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "导出文本到", str(start), EXPORT_NAME_FILTER
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if not path.suffix:  # 只填了名字时补上 .txt，填了别的后缀就听用户的
+            path = path.with_suffix(EXPORT_SUFFIX)
+        self._export_to(path)
+
+    def _warn_export_unavailable(self) -> None:
+        """默认导出位置拿不到时的报错（没有打开图像 / 文件夹已经不在了）。"""
+        if not self._paths:
+            message = "还没有打开图像，先打开文件夹或导入图像再导出。"
+        else:
+            message = (
+                "找不到图像所在的文件夹，无法确定默认的导出位置：\n"
+                f"{self._paths[0].parent}\n\n"
+                "可以改用「导出 → 导出文本到」自己选一个位置。"
+            )
+        QMessageBox.warning(self, "无法导出", message)
+
+    def _export_to(self, path: Path) -> None:
+        """把当前这批图像的 ROI 文本拼好写进 ``path``。"""
+        self._flush_rois()  # 当前图还没落盘的改动先写回，导出的就是最新内容
+        pages = self._export_pages()
+        if not pages:
+            self.statusBar().showMessage("没有可导出的标注：已打开的图都没有 ROI", 5000)
+            return
+        try:
+            write_export(path, build_text(pages))
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"写入 {path} 失败：\n{exc}")
+            return
+        count = sum(len(texts) for _, texts in pages)
+        self.statusBar().showMessage(
+            f"已导出 {len(pages)} 张图、{count} 个标注的文本到 {path}", 8000
+        )
+
+    def _export_pages(self) -> list[tuple[str, list[str]]]:
+        """按工具里的图像顺序收集要导出的内容：没有 ROI 的图整张跳过。
+
+        读的是 :class:`RoiStore`（内存缓存 + 边车文件）：没有边车文件的图和"有文件但
+        一条记录都没有"的图一样，这里读出来都是空列表，于是被整张跳过。当前这张图
+        的改动由 :meth:`_export_to` 开头的 ``_flush_rois()`` 先写回，所以拿到的是最新内容。
+        """
+        pages: list[tuple[str, list[str]]] = []
+        for path in self._paths:
+            rois = self._roi_store.get(path)
+            if not rois:
+                continue
+            pages.append((path.name, [roi.text for roi in rois]))
+        return pages
 
     # -------------------------------------------------------------- 文本框排版
 
@@ -1031,6 +1142,12 @@ class MainWindow(QMainWindow):
             "    横排贴上下、竖排贴左右；光标放在框上滚滚轮可以调字号\n"
             "  「视图 → 文本框排版方向」切换横排 / 竖排（记进设置）\n"
             "  标注自动保存在图像旁的 <文件名>.roi.json，切图时自动保存与恢复\n"
+            "\n"
+            "导出\n"
+            "  Ctrl+E                              导出文本到图像文件夹里的 <文件夹名>.txt\n"
+            "  Ctrl+Shift+E                        选择导出位置（弹出保存对话框）\n"
+            "  导出已打开图像的全部 ROI 文本，按图像顺序与 ROI 顺序排列；\n"
+            "  没有 ROI 的图整张跳过，识别文本原样输出（空白就是空行）\n"
             "\n"
             "OCR\n"
             "  Ctrl+R                              识别选中的标注\n"
